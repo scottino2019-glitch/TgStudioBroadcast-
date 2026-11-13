@@ -119,7 +119,7 @@ export class AudioLipSyncEngine {
     const buffers: AudioBuffer[] = [];
     for (const chunk of base64Chunks) {
       const arrBuf = this.decodeBase64ToArrayBuffer(chunk);
-      const audioBuffer = await ctx.decodeAudioData(arrBuf);
+      const audioBuffer = await ctx.decodeAudioData(arrBuf.slice(0));
       buffers.push(audioBuffer);
     }
     return buffers;

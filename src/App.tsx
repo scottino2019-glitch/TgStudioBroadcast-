@@ -328,7 +328,7 @@ export default function App() {
     }
     const controller = new AbortController();
     ttsAbortRef.current = controller;
-    const timeoutId = window.setTimeout(() => controller.abort(), 15000);
+    const timeoutId = window.setTimeout(() => controller.abort(), 90000);
 
     try {
       const res = await fetch('/api/free-tts', {
@@ -598,8 +598,9 @@ export default function App() {
         chunks = audioData.chunks;
       } catch (audioErr: any) {
         console.error('Impossibile preparare audio registrabile:', audioErr);
+        const detail = audioErr?.message ? ` (${audioErr.message})` : '';
         setVoiceNotice(
-          'Audio TTS non raggiungibile al momento: impossibile registrare la voce nel video. Controlla la connessione o riprova.'
+          `Audio TTS non raggiungibile al momento${detail}: impossibile registrare la voce nel video.`
         );
         return;
       }

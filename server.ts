@@ -85,16 +85,89 @@ function mapToGoogleTtsLang(langTag: string | undefined): string {
   return lower.split('-')[0] || 'it';
 }
 
-async function fetchTtsChunkWithRetry(chunkText: string, tl: string): Promise<string> {
-  const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
-    chunkText
-  )}&tl=${encodeURIComponent(tl)}&client=tw-ob`;
+const MAX_TTS_CACHE = 120;
+const ttsChunkCache = new Map<string, string>();
+
+function setTtsCache(key: string, value: string) {
+  if (!ttsChunkCache.has(key) && ttsChunkCache.size >= MAX_TTS_CACHE) {
+    const oldestKey = ttsChunkCache.keys().next().value;
+    if (oldestKey) ttsChunkCache.delete(oldestKey);
+  }
+  ttsChunkCache.set(key, value);
+}
+
+function sanitizeTextForTts(text: string): string {
+  return text
+    .replace(/[’‘]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[•·]/g, ', ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function hasSpeakableContent(text: string): boolean {
+  return /[\p{L}\p{N}]/u.test(text);
+}
+
+async function synthesizeFliteMp3Fallback(text: string): Promise<string> {
+  const safeText =
+    sanitizeTextForTts(text)
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9 ,.?!;:'"-]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim() || 'Notiziario in onda';
+
+  const id = crypto.randomUUID();
+  const tmpTxtFile = path.join(os.tmpdir(), `tgstudio-flite-${id}.txt`);
+  const tmpMp3File = path.join(os.tmpdir(), `tgstudio-flite-${id}.mp3`);
+  try {
+    await fs.promises.writeFile(tmpTxtFile, safeText, 'utf-8');
+    await execFileAsync(
+      'ffmpeg',
+      [
+        '-y',
+        '-f', 'lavfi',
+        '-i', `flite=textfile=${tmpTxtFile.replace(/\\/g, '/').replace(/:/g, '\\:')}`,
+        '-ar', '24000',
+        '-ac', '1',
+        '-c:a', 'libmp3lame',
+        '-b:a', '64k',
+        tmpMp3File,
+      ],
+      { timeout: 15000 }
+    );
+    const buf = await fs.promises.readFile(tmpMp3File);
+    if (!buf || buf.length === 0) {
+      throw new Error('Flite fallback audio vuoto.');
+    }
+    return buf.toString('base64');
+  } finally {
+    fs.promises.rm(tmpTxtFile, { force: true }).catch(() => {});
+    fs.promises.rm(tmpMp3File, { force: true }).catch(() => {});
+  }
+}
+
+async function fetchTtsChunkWithFallback(chunkText: string, tl: string): Promise<string> {
+  const cleanChunk = sanitizeTextForTts(chunkText);
+  const cacheKey = `${tl}:${cleanChunk}`;
+  const cached = ttsChunkCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const encoded = encodeURIComponent(cleanChunk);
+  const endpoints = [
+    `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encoded}&tl=${encodeURIComponent(tl)}&client=gtx`,
+    `https://translate.google.com/translate_tts?ie=UTF-8&q=${encoded}&tl=${encodeURIComponent(tl)}&client=dict-chrome-ex`,
+    `https://translate.google.com/translate_tts?ie=UTF-8&q=${encoded}&tl=${encodeURIComponent(tl)}&client=tw-ob`,
+  ];
 
   let lastError: Error | null = null;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (const ttsUrl of endpoints) {
     try {
       const response = await fetch(ttsUrl, {
-        signal: AbortSignal.timeout(8000),
+        signal: AbortSignal.timeout(4500),
         headers: {
           'User-Agent':
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -103,26 +176,37 @@ async function fetchTtsChunkWithRetry(chunkText: string, tl: string): Promise<st
       });
 
       if (!response.ok) {
-        throw new Error(`Sintesi audio temporaneamente non disponibile (HTTP ${response.status}).`);
+        lastError = new Error(`HTTP ${response.status}`);
+        continue;
+      }
+
+      const contentType = (response.headers.get('content-type') || '').toLowerCase();
+      if (contentType && !contentType.includes('audio') && !contentType.includes('octet-stream')) {
+        lastError = new Error(`Content-Type non audio: ${contentType}`);
+        continue;
       }
 
       const arrBuf = await response.arrayBuffer();
-      if (!arrBuf || arrBuf.byteLength === 0) {
-        throw new Error('Flusso audio ricevuto vuoto.');
+      if (!arrBuf || arrBuf.byteLength < 128) {
+        lastError = new Error('Flusso audio ricevuto vuoto o troncato.');
+        continue;
       }
-      return Buffer.from(arrBuf).toString('base64');
+
+      const base64 = Buffer.from(arrBuf).toString('base64');
+      setTtsCache(cacheKey, base64);
+      return base64;
     } catch (err: any) {
       lastError = err instanceof Error ? err : new Error(String(err));
-      if (attempt === 0) {
-        await new Promise((r) => setTimeout(r, 200));
-      }
     }
   }
 
-  throw lastError || new Error('Errore durante il recupero audio TTS.');
+  console.warn('Google TTS non disponibile, uso sintetizzatore locale Flite:', lastError?.message);
+  const fliteBase64 = await synthesizeFliteMp3Fallback(cleanChunk);
+  setTtsCache(cacheKey, fliteBase64);
+  return fliteBase64;
 }
 
-// Zero-config, zero-token Google Studio TTS audio endpoint
+// Zero-config, zero-token Google Studio TTS audio endpoint (with multi-endpoint fallback + local Flite backup)
 app.post('/api/free-tts', async (req, res) => {
   try {
     const { text, lang = 'it-IT' } = req.body || {};
@@ -131,16 +215,17 @@ app.post('/api/free-tts', async (req, res) => {
     }
 
     const tl = mapToGoogleTtsLang(lang);
-    const textChunks = splitTextForTtsChunks(text, 170);
+    const textChunks = splitTextForTtsChunks(sanitizeTextForTts(text), 170).filter(hasSpeakableContent);
     if (textChunks.length === 0) {
       return res.status(400).json({ error: 'Copione vuoto.' });
     }
 
+    // Fetch in small batches of 2 to stay fast on long scripts without triggering Google burst rate limits
     const audioChunks: string[] = [];
-    for (let i = 0; i < textChunks.length; i += 3) {
-      const batch = textChunks.slice(i, i + 3);
+    for (let i = 0; i < textChunks.length; i += 2) {
+      const batch = textChunks.slice(i, i + 2);
       const batchResults = await Promise.all(
-        batch.map((chunkText) => fetchTtsChunkWithRetry(chunkText, tl))
+        batch.map((chunk) => fetchTtsChunkWithFallback(chunk, tl))
       );
       audioChunks.push(...batchResults);
     }
