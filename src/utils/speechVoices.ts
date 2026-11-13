@@ -4,10 +4,15 @@ export interface SystemVoiceItem {
   name: string;
   lang: string;
   voiceURI: string;
+  isGoogle: boolean;
 }
 
 function normalizeLangTag(lang: string | undefined): string {
   return (lang || '').trim().replace(/_/g, '-').toLowerCase();
+}
+
+export function isGoogleVoice(voice: Pick<SpeechSynthesisVoice, 'name' | 'voiceURI'>): boolean {
+  return /google/i.test(voice.name || '') || /google/i.test(voice.voiceURI || '');
 }
 
 export function getAllSystemVoices(): SystemVoiceItem[] {
@@ -16,18 +21,34 @@ export function getAllSystemVoices(): SystemVoiceItem[] {
   }
 
   const rawVoices = window.speechSynthesis.getVoices() || [];
-  return rawVoices.map((voice, index) => ({
+  const items: SystemVoiceItem[] = rawVoices.map((voice, index) => ({
     key: `${voice.voiceURI || voice.name || 'voice'}::${voice.lang || ''}::${index}`,
     voice,
     name: voice.name || voice.voiceURI || `Voce ${index + 1}`,
     lang: voice.lang || '',
     voiceURI: voice.voiceURI || '',
+    isGoogle: isGoogleVoice(voice),
   }));
+
+  // Prioritize Google voices first so the user sees Google TTS voices at the top
+  return items.sort((a, b) => {
+    if (a.isGoogle !== b.isGoogle) return a.isGoogle ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+}
+
+function matchesGenderHint(name: string, gender: 'male' | 'female'): boolean {
+  const lower = name.toLowerCase();
+  if (gender === 'female') {
+    return /(female|woman|donna|alice|federica|elsa|paola|silvia|laura|sara|elena|svetlana|amira|kyoko|haruka|xiaoxiao|zira|samantha|victoria|karen|hortense|julie|helena|hedda|katja)/i.test(lower);
+  }
+  return /(male|man|uomo|luca|cosimo|diego|giorgio|matteo|marco|kenji|ichiro|daniel|george|david|mark|thomas|stefan|pablo|paul|pavel)/i.test(lower);
 }
 
 export function resolveSystemVoice(
   selectedVoiceKey: string,
-  targetWebSpeechLang: string
+  targetWebSpeechLang: string,
+  preferredGender?: 'male' | 'female'
 ): SpeechSynthesisVoice | null {
   const all = getAllSystemVoices();
   if (all.length === 0) return null;
@@ -41,7 +62,6 @@ export function resolveSystemVoice(
     );
     if (exact) return exact.voice;
 
-    // Also match if saved key came from an older format containing "::voiceURI::name::lang"
     const keyParts = selectedVoiceKey.split('::').filter(Boolean);
     if (keyParts.length >= 2) {
       const byParts = all.find(
@@ -78,15 +98,27 @@ export function resolveSystemVoice(
   };
   const iso3 = iso3Map[base] || '';
 
+  const pickBest = (candidates: SystemVoiceItem[]): SystemVoiceItem | undefined => {
+    if (candidates.length === 0) return undefined;
+    if (preferredGender) {
+      const googleGender = candidates.find(
+        (v) => v.isGoogle && matchesGenderHint(v.name, preferredGender)
+      );
+      if (googleGender) return googleGender;
+      const anyGender = candidates.find((v) => matchesGenderHint(v.name, preferredGender));
+      if (anyGender) return anyGender;
+    }
+    return (
+      candidates.find((v) => v.isGoogle) ||
+      candidates.find((v) => v.voice.localService) ||
+      candidates.find((v) => v.voice.default) ||
+      candidates[0]
+    );
+  };
+
   const exactLangMatches = all.filter((item) => normalizeLangTag(item.lang) === target);
-  if (exactLangMatches.length > 0) {
-    const preferred =
-      exactLangMatches.find((v) => /google/i.test(v.name)) ||
-      exactLangMatches.find((v) => v.voice.localService) ||
-      exactLangMatches.find((v) => v.voice.default) ||
-      exactLangMatches[0];
-    return preferred.voice;
-  }
+  const exactPick = pickBest(exactLangMatches);
+  if (exactPick) return exactPick.voice;
 
   const baseLangMatches = all.filter((item) => {
     const n = normalizeLangTag(item.lang);
@@ -97,16 +129,9 @@ export function resolveSystemVoice(
       (base === 'it' && /italian|italiano/i.test(item.name))
     );
   });
-  if (baseLangMatches.length > 0) {
-    const preferred =
-      baseLangMatches.find((v) => /google/i.test(v.name)) ||
-      baseLangMatches.find((v) => v.voice.localService) ||
-      baseLangMatches[0];
-    return preferred.voice;
-  }
+  const basePick = pickBest(baseLangMatches);
+  if (basePick) return basePick.voice;
 
-  // NEVER fall back to all[0] (which is often en-US and gives Italian a foreign accent).
-  // Returning null lets utterance.lang instruct the OS/browser to speak in the target language natively.
   return null;
 }
 

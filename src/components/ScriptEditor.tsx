@@ -6,7 +6,6 @@ import {
   getAllSystemVoices,
   resolveSystemVoice,
 } from '../utils/speechVoices';
-import { globalAudioEngine } from '../utils/audioAnalyzer';
 import {
   Globe,
   Mic,
@@ -77,46 +76,17 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
     };
   }, []);
 
-  const handleTestVoice = async () => {
+  const handleTestVoice = () => {
     const sampleLine =
       state.scriptText.trim().split(/[.!?]/)[0]?.trim() ||
       currentLanguage.sampleScript.split(/[.!?]/)[0]?.trim() ||
       'Buonasera e benvenuti al telegiornale.';
 
-    if (!state.selectedVoiceURI) {
-      globalAudioEngine.unlockAudio();
-      setIsTestingVoice(true);
-      try {
-        const controller = new AbortController();
-        const timer = window.setTimeout(() => controller.abort(), 12000);
-        const res = await fetch('/api/free-tts', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          signal: controller.signal,
-          body: JSON.stringify({
-            text: sampleLine.slice(0, 140),
-            lang: currentLanguage.webSpeechLang,
-          }),
-        });
-        window.clearTimeout(timer);
-        if (res.ok) {
-          const data = await res.json();
-          if (data.chunks?.length) {
-            await globalAudioEngine.playAudioChunksBase64(
-              data.chunks,
-              () => {},
-              () => setIsTestingVoice(false)
-            );
-            return;
-          }
-        }
-      } catch {
-        // Fallback below
-      }
-      setIsTestingVoice(false);
+    if (typeof window === 'undefined' || !window.speechSynthesis) {
+      setStatusMessage('Sintesi vocale Web Speech non disponibile su questo browser.');
+      return;
     }
 
-    if (typeof window === 'undefined' || !window.speechSynthesis) return;
     const wasSpeaking = window.speechSynthesis.speaking || window.speechSynthesis.pending;
     window.speechSynthesis.cancel();
 
@@ -130,6 +100,9 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
       } else {
         utterance.lang = currentLanguage.webSpeechLang;
       }
+
+      utterance.pitch = state.voicePitch ?? 1.0;
+      utterance.rate = state.voiceRate ?? 1.0;
 
       setIsTestingVoice(true);
       utterance.onend = () => setIsTestingVoice(false);
@@ -145,6 +118,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
   };
 
   const autoMatchedVoice = resolveSystemVoice('', currentLanguage.webSpeechLang);
+  const googleVoicesCount = voices.filter((v) => v.isGoogle).length;
 
   // Approximate reading duration
   const wordCount = state.scriptText.trim().split(/\s+/).filter(Boolean).length;
@@ -250,13 +224,13 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
           </div>
         </div>
 
-        {/* Pure Unfiltered Voice Selector */}
-        <div className="pt-3 border-t border-slate-800/80 space-y-2.5">
+        {/* Pure Browser Google Voice Selector (Zero Server Dependency) */}
+        <div className="pt-3 border-t border-slate-800/80 space-y-3">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <Volume2 className="w-4 h-4 text-emerald-400" />
               <span className="text-xs font-semibold text-slate-200">
-                Tutte le Voci Disponibili ({voices.length})
+                Voci Google & Dispositivo ({voices.length} totali{googleVoicesCount > 0 ? ` · ${googleVoicesCount} Google` : ''})
               </span>
             </div>
 
@@ -264,7 +238,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
               type="button"
               onClick={() => {
                 const refreshed = loadVoices();
-                setStatusMessage(`Rilevate ${refreshed.length} voci dal browser/dispositivo.`);
+                setStatusMessage(`Rilevate ${refreshed.length} voci dirette dal browser/dispositivo.`);
                 setTimeout(() => setStatusMessage(null), 2500);
               }}
               className="px-2.5 py-1 text-[11px] text-slate-300 hover:text-white bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors flex items-center gap-1.5"
@@ -282,11 +256,11 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
               className="flex-1 bg-slate-950 border border-slate-700/80 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
             >
               <option value="">
-                Google Studio Audio ({currentLanguage.name} · Registrabile nei Video HD)
+                Automatica Google ({autoMatchedVoice ? `${autoMatchedVoice.name} · ${autoMatchedVoice.lang}` : currentLanguage.webSpeechLang})
               </option>
               {voices.map((v) => (
                 <option key={v.key} value={v.key}>
-                  {v.name} ({v.lang}) · Solo Ascolto
+                  {v.isGoogle ? `★ ${v.name}` : v.name} ({v.lang})
                 </option>
               ))}
             </select>
@@ -306,8 +280,42 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
             </button>
           </div>
 
+          {/* Pitch & Rate Sliders for Voice Variation */}
+          <div className="grid grid-cols-2 gap-3 pt-1">
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span>Timbro / Tono</span>
+                <span className="font-data text-slate-200">{(state.voicePitch ?? 1.0).toFixed(2)}</span>
+              </div>
+              <input
+                type="range"
+                min="0.75"
+                max="1.30"
+                step="0.05"
+                value={state.voicePitch ?? 1.0}
+                onChange={(e) => onChange({ voicePitch: parseFloat(e.target.value) })}
+                className="w-full accent-sky-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+              />
+            </div>
+            <div className="space-y-1">
+              <div className="flex items-center justify-between text-[11px] text-slate-400">
+                <span>Velocità Lettura</span>
+                <span className="font-data text-slate-200">{(state.voiceRate ?? 1.0).toFixed(2)}x</span>
+              </div>
+              <input
+                type="range"
+                min="0.80"
+                max="1.25"
+                step="0.05"
+                value={state.voiceRate ?? 1.0}
+                onChange={(e) => onChange({ voiceRate: parseFloat(e.target.value) })}
+                className="w-full accent-emerald-500 h-1.5 bg-slate-800 rounded-lg cursor-pointer"
+              />
+            </div>
+          </div>
+
           <p className="text-[11px] text-slate-400 leading-relaxed">
-            La voce predefinita <strong className="text-emerald-300">Google Studio Audio</strong> usa la pronuncia nativa {currentLanguage.name} senza chiavi API e viene <strong className="text-slate-200">registrata direttamente dentro i video HD</strong>. Sotto sono elencate senza filtri tutte le <strong className="text-slate-200">{voices.length} voci</strong> del browser/dispositivo{autoMatchedVoice ? ` (voce dispositivo rilevata per ${currentLanguage.name}: ${autoMatchedVoice.name})` : ''}.
+            Sintesi diretta tramite il servizio voci Google del browser (senza server né blocchi). Seleziona qualsiasi voce sopra o regola il timbro per differenziare ogni conduttore.
           </p>
         </div>
       </div>

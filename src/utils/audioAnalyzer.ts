@@ -20,6 +20,7 @@ export class AudioLipSyncEngine {
 
   private keepAliveStarted = false;
   private playbackSessionId = 0;
+  private externalSource: MediaStreamAudioSourceNode | null = null;
 
   private initContext(): AudioContext {
     if (!this.audioCtx) {
@@ -215,6 +216,36 @@ export class AudioLipSyncEngine {
     await this.playAudioBuffers(buffers, onFrame, onEnded);
   }
 
+  public async startExternalStreamAnalysis(
+    stream: MediaStream,
+    onFrame: (metrics: VisemeMetrics) => void
+  ): Promise<void> {
+    this.stop();
+    const ctx = this.initContext();
+    if (ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch {
+        // Continue
+      }
+    }
+
+    this.onMetricsUpdate = onFrame;
+    this.onEndedCallback = null;
+
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.6;
+    this.analyser = analyser;
+
+    const source = ctx.createMediaStreamSource(stream);
+    source.connect(analyser);
+    this.externalSource = source;
+
+    this.isPlaying = true;
+    this.startAnalysisLoop();
+  }
+
   public startSpeechSimulation(
     estimatedDurationSec: number,
     onFrame: (metrics: VisemeMetrics) => void,
@@ -361,6 +392,14 @@ export class AudioLipSyncEngine {
       } catch {
         // Ignore already stopped sources
       }
+    }
+    if (this.externalSource) {
+      try {
+        this.externalSource.disconnect();
+      } catch {
+        // Ignore
+      }
+      this.externalSource = null;
     }
     this.scheduledSources = [];
 

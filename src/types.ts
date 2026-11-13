@@ -86,6 +86,8 @@ export interface BroadcastState {
   selectedLanguage: string;
   scriptText: string;
   selectedVoiceURI: string;
+  voicePitch?: number;
+  voiceRate?: number;
   pip: PipGraphic;
   lowerThird: LowerThirdConfig;
   ticker: TickerConfig;

@@ -18,36 +18,39 @@ export class VideoRecorderManager {
 
   private createRecorderWithFallbacks(
     canvasStream: MediaStream,
-    audioStream: MediaStream | null
+    audioStream: MediaStream | null,
+    hasRealAudio: boolean
   ): { recorder: MediaRecorder; hasAudio: boolean } {
     const combinedStream = new MediaStream();
     canvasStream.getVideoTracks().forEach((track) => {
       combinedStream.addTrack(track);
     });
 
-    let addedAudio = false;
+    let addedAudioTrack = false;
     if (audioStream) {
       audioStream.getAudioTracks().forEach((track) => {
         if (track.readyState === 'live') {
           combinedStream.addTrack(track);
-          addedAudio = true;
+          addedAudioTrack = true;
         }
       });
     }
 
-    const candidateMimeTypes = addedAudio
+    const candidateMimeTypes = addedAudioTrack
       ? [
+          'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+          'video/mp4;codecs=avc1,mp4a.40.2',
+          'video/mp4',
           'video/webm;codecs=vp8,opus',
           'video/webm;codecs=vp9,opus',
-          'video/mp4;codecs=avc1,mp4a.40.2',
           'video/webm',
-          'video/mp4',
         ]
       : [
+          'video/mp4;codecs=avc1.42E01E',
+          'video/mp4',
           'video/webm;codecs=vp8',
           'video/webm;codecs=vp9',
           'video/webm',
-          'video/mp4',
         ];
 
     const supportedMime =
@@ -55,21 +58,23 @@ export class VideoRecorderManager {
         ? candidateMimeTypes.find((m) => MediaRecorder.isTypeSupported(m))
         : undefined;
 
+    const effectiveHasAudio = addedAudioTrack && hasRealAudio;
+
     if (supportedMime) {
       try {
         return {
           recorder: new MediaRecorder(combinedStream, {
             mimeType: supportedMime,
-            videoBitsPerSecond: 2_200_000,
-            ...(addedAudio ? { audioBitsPerSecond: 128_000 } : {}),
+            videoBitsPerSecond: 2_800_000,
+            ...(addedAudioTrack ? { audioBitsPerSecond: 128_000 } : {}),
           }),
-          hasAudio: addedAudio,
+          hasAudio: effectiveHasAudio,
         };
       } catch {
         try {
           return {
             recorder: new MediaRecorder(combinedStream, { mimeType: supportedMime }),
-            hasAudio: addedAudio,
+            hasAudio: effectiveHasAudio,
           };
         } catch {
           // Continue to fallbacks
@@ -80,7 +85,7 @@ export class VideoRecorderManager {
     try {
       return {
         recorder: new MediaRecorder(combinedStream),
-        hasAudio: addedAudio,
+        hasAudio: effectiveHasAudio,
       };
     } catch {
       return {
@@ -93,7 +98,8 @@ export class VideoRecorderManager {
   public startRecording(
     canvas: HTMLCanvasElement,
     audioStream: MediaStream | null,
-    onTick?: (seconds: number) => void
+    onTick?: (seconds: number) => void,
+    hasRealAudio = true
   ): boolean {
     if (this.isRecording) return false;
 
@@ -102,7 +108,11 @@ export class VideoRecorderManager {
       const canvasStream = canvas.captureStream(30);
       this.canvasStream = canvasStream;
 
-      const { recorder, hasAudio } = this.createRecorderWithFallbacks(canvasStream, audioStream);
+      const { recorder, hasAudio } = this.createRecorderWithFallbacks(
+        canvasStream,
+        audioStream,
+        hasRealAudio
+      );
       this.mediaRecorder = recorder;
       this.hasAudioTrack = hasAudio;
 
