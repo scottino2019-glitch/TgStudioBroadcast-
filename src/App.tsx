@@ -125,6 +125,7 @@ export default function App() {
   const speechKeepAliveRef = useRef<number | null>(null);
   const chunkWatchdogRef = useRef<number | null>(null);
   const recordedAudioChunksRef = useRef<string[]>([]);
+  const recordedAudioIdRef = useRef<string>('');
 
   // Keep refs synchronized on every render to eliminate stale closures
   stateRef.current = state;
@@ -215,9 +216,9 @@ export default function App() {
     langTag: string,
     pitch: number,
     rate: number
-  ): Promise<string[]> => {
+  ): Promise<{ audioId: string; chunks: string[] }> => {
     const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), 90000);
+    const timeoutId = window.setTimeout(() => controller.abort(), 45000);
 
     try {
       const resp = await fetch('/api/free-tts', {
@@ -228,13 +229,8 @@ export default function App() {
       });
 
       if (!resp.ok) {
-        if (resp.status === 404) {
-          throw new Error(
-            'Servizio audio server (/api/free-tts) non raggiungibile su questo indirizzo statico (HTTP 404). Apri l’app dall’URL di sviluppo per esportare MP4 con audio vocale.'
-          );
-        }
         const errBody = await resp.json().catch(() => ({}));
-        throw new Error(errBody?.error || `Errore generazione voce (HTTP ${resp.status}).`);
+        throw new Error(errBody?.error || `Servizio vocale non disponibile (HTTP ${resp.status}).`);
       }
 
       const data = await resp.json();
@@ -242,10 +238,13 @@ export default function App() {
         throw new Error('Nessun blocco audio restituito dal servizio vocale.');
       }
 
-      return data.chunks;
+      return {
+        audioId: typeof data.audioId === 'string' ? data.audioId : '',
+        chunks: data.chunks,
+      };
     } catch (err: any) {
       if (err?.name === 'AbortError') {
-        throw new Error('Timeout durante la sintesi vocale del copione.');
+        throw new Error('Timeout durante la sintesi vocale del copione. Riprova.');
       }
       throw err;
     } finally {
@@ -282,7 +281,9 @@ export default function App() {
     setIsFinalizingCredits(true);
 
     const activeRecordedChunks = [...recordedAudioChunksRef.current];
+    const activeAudioId = recordedAudioIdRef.current;
     recordedAudioChunksRef.current = [];
+    recordedAudioIdRef.current = '';
     handleStopSpeech();
 
     const currentCredits = stateRef.current.endCredits;
@@ -302,17 +303,39 @@ export default function App() {
       setRecordingSeconds(0);
 
       setIsExportingMp4(true);
-      const videoBase64 = await blobToBase64(rawResult.blob);
 
-      const exportResp = await fetch('/api/export-mp4', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          videoBase64,
-          videoFormat: rawResult.format,
-          audioChunks: activeRecordedChunks,
-        }),
-      });
+      const exportController = new AbortController();
+      const exportTimer = window.setTimeout(() => exportController.abort(), 65000);
+      let exportResp: Response;
+
+      try {
+        // Fast binary stream upload (zero FileReader, zero 33% base64 bloat)
+        exportResp = await fetch(
+          `/api/export-mp4-bin?format=${encodeURIComponent(rawResult.format)}&audioId=${encodeURIComponent(activeAudioId)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/octet-stream' },
+            body: rawResult.blob,
+            signal: exportController.signal,
+          }
+        );
+
+        if (exportResp.status === 404 || exportResp.status === 410) {
+          const videoBase64 = await blobToBase64(rawResult.blob);
+          exportResp = await fetch('/api/export-mp4', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              videoBase64,
+              videoFormat: rawResult.format,
+              audioChunks: activeRecordedChunks,
+            }),
+            signal: exportController.signal,
+          });
+        }
+      } finally {
+        window.clearTimeout(exportTimer);
+      }
 
       if (!exportResp.ok) {
         const errData = await exportResp.json().catch(() => ({}));
@@ -381,7 +404,7 @@ export default function App() {
       globalAudioEngine.unlockAudio();
 
       try {
-        const chunks = await fetchRecordableStudioAudio(
+        const { chunks } = await fetchRecordableStudioAudio(
           text,
           currentLanguage.webSpeechLang,
           pitch,
@@ -585,13 +608,14 @@ export default function App() {
         stateRef.current.voiceRate ?? 1.0
       );
 
-      const audioChunks = await fetchRecordableStudioAudio(
+      const { audioId, chunks: audioChunks } = await fetchRecordableStudioAudio(
         text,
         currentLanguage.webSpeechLang,
         pitch,
         rate
       );
       const audioBuffers = await globalAudioEngine.decodeAudioChunksBase64(audioChunks);
+      recordedAudioIdRef.current = audioId;
       recordedAudioChunksRef.current = audioChunks;
 
       const started = globalVideoRecorder.startRecording(
@@ -602,6 +626,7 @@ export default function App() {
       );
 
       if (!started) {
+        recordedAudioIdRef.current = '';
         recordedAudioChunksRef.current = [];
         setVoiceNotice('Impossibile avviare la registrazione video su questo browser.');
         return;
@@ -625,6 +650,7 @@ export default function App() {
       });
     } catch (err: any) {
       console.error('Errore avvio registrazione con audio:', err);
+      recordedAudioIdRef.current = '';
       recordedAudioChunksRef.current = [];
       setVoiceNotice(
         err?.message || 'Impossibile generare la traccia audio vocale per la registrazione video.'

@@ -55,6 +55,18 @@ export class AudioLipSyncEngine {
     return { gain: this.playbackGain, dest: this.mediaStreamDest };
   }
 
+  private async safeResumeContext(ctx: AudioContext): Promise<void> {
+    if (ctx.state !== 'suspended') return;
+    try {
+      await Promise.race([
+        ctx.resume(),
+        new Promise<void>((resolve) => window.setTimeout(resolve, 400)),
+      ]);
+    } catch {
+      // Continue without blocking if autoplay restriction delays resume
+    }
+  }
+
   public unlockAudio(): void {
     try {
       const ctx = this.initContext();
@@ -71,9 +83,7 @@ export class AudioLipSyncEngine {
     try {
       const ctx = this.initContext();
       const { dest } = this.ensureRoutingNodes(ctx);
-      if (ctx.state === 'suspended') {
-        await ctx.resume();
-      }
+      await this.safeResumeContext(ctx);
       return dest.stream;
     } catch (err) {
       console.warn('MediaStream audio non disponibile:', err);
@@ -108,21 +118,15 @@ export class AudioLipSyncEngine {
   public async decodeAudioChunksBase64(base64Chunks: string[]): Promise<AudioBuffer[]> {
     const ctx = this.initContext();
     this.ensureRoutingNodes(ctx);
-    if (ctx.state === 'suspended') {
-      try {
-        await ctx.resume();
-      } catch {
-        // Continue
-      }
-    }
+    await this.safeResumeContext(ctx);
 
-    const buffers: AudioBuffer[] = [];
-    for (const chunk of base64Chunks) {
-      const arrBuf = this.decodeBase64ToArrayBuffer(chunk);
-      const audioBuffer = await ctx.decodeAudioData(arrBuf.slice(0));
-      buffers.push(audioBuffer);
-    }
-    return buffers;
+    const decoded = await Promise.all(
+      base64Chunks.map(async (chunk) => {
+        const arrBuf = this.decodeBase64ToArrayBuffer(chunk);
+        return ctx.decodeAudioData(arrBuf.slice(0));
+      })
+    );
+    return decoded;
   }
 
   /**
@@ -144,13 +148,7 @@ export class AudioLipSyncEngine {
     const ctx = this.initContext();
     const { gain } = this.ensureRoutingNodes(ctx);
 
-    if (ctx.state === 'suspended') {
-      try {
-        await ctx.resume();
-      } catch {
-        // Continue
-      }
-    }
+    await this.safeResumeContext(ctx);
     if (sessionId !== this.playbackSessionId) return;
 
     this.onMetricsUpdate = onFrame;

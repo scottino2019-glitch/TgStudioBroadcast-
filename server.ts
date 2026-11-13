@@ -21,7 +21,7 @@ const isProduction = process.env.NODE_ENV === 'production';
 
 const defaultJsonParser = express.json({ limit: '10mb' });
 app.use((req, res, next) => {
-  if (req.path === '/api/export-mp4') return next();
+  if (req.path === '/api/export-mp4' || req.path === '/api/export-mp4-bin') return next();
   return defaultJsonParser(req, res, next);
 });
 
@@ -91,6 +91,9 @@ function mapToGoogleTtsLang(langTag: string | undefined): string {
 
 const MAX_TTS_CACHE = 120;
 const ttsChunkCache = new Map<string, string>();
+const MAX_TTS_JOBS = 30;
+const ttsJobCache = new Map<string, string[]>();
+let googleTtsCircuitOpenUntil = 0;
 
 function setTtsCache(key: string, value: string) {
   if (!ttsChunkCache.has(key) && ttsChunkCache.size >= MAX_TTS_CACHE) {
@@ -98,6 +101,14 @@ function setTtsCache(key: string, value: string) {
     if (oldestKey) ttsChunkCache.delete(oldestKey);
   }
   ttsChunkCache.set(key, value);
+}
+
+function setTtsJobCache(audioId: string, chunks: string[]) {
+  if (!ttsJobCache.has(audioId) && ttsJobCache.size >= MAX_TTS_JOBS) {
+    const oldestKey = ttsJobCache.keys().next().value;
+    if (oldestKey) ttsJobCache.delete(oldestKey);
+  }
+  ttsJobCache.set(audioId, chunks);
 }
 
 function sanitizeTextForTts(text: string): string {
@@ -234,39 +245,45 @@ async function fetchTtsChunkWithFallback(
     ];
 
     let lastError: Error | null = null;
-    for (const ttsUrl of endpoints) {
-      try {
-        const response = await fetch(ttsUrl, {
-          signal: AbortSignal.timeout(4500),
-          headers: {
-            'User-Agent':
-              'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
-            Accept: 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8',
-          },
-        });
+    if (Date.now() >= googleTtsCircuitOpenUntil) {
+      for (const ttsUrl of endpoints) {
+        try {
+          const response = await fetch(ttsUrl, {
+            signal: AbortSignal.timeout(2800),
+            headers: {
+              'User-Agent':
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+              Accept: 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8',
+            },
+          });
 
-        if (!response.ok) {
-          lastError = new Error(`HTTP ${response.status}`);
-          continue;
+          if (!response.ok) {
+            lastError = new Error(`HTTP ${response.status}`);
+            continue;
+          }
+
+          const contentType = (response.headers.get('content-type') || '').toLowerCase();
+          if (contentType && !contentType.includes('audio') && !contentType.includes('octet-stream')) {
+            lastError = new Error(`Content-Type non audio: ${contentType}`);
+            continue;
+          }
+
+          const arrBuf = await response.arrayBuffer();
+          if (!arrBuf || arrBuf.byteLength < 128) {
+            lastError = new Error('Flusso audio ricevuto vuoto o troncato.');
+            continue;
+          }
+
+          rawBase64 = Buffer.from(arrBuf).toString('base64');
+          setTtsCache(rawCacheKey, rawBase64);
+          break;
+        } catch (err: any) {
+          lastError = err instanceof Error ? err : new Error(String(err));
         }
+      }
 
-        const contentType = (response.headers.get('content-type') || '').toLowerCase();
-        if (contentType && !contentType.includes('audio') && !contentType.includes('octet-stream')) {
-          lastError = new Error(`Content-Type non audio: ${contentType}`);
-          continue;
-        }
-
-        const arrBuf = await response.arrayBuffer();
-        if (!arrBuf || arrBuf.byteLength < 128) {
-          lastError = new Error('Flusso audio ricevuto vuoto o troncato.');
-          continue;
-        }
-
-        rawBase64 = Buffer.from(arrBuf).toString('base64');
-        setTtsCache(rawCacheKey, rawBase64);
-        break;
-      } catch (err: any) {
-        lastError = err instanceof Error ? err : new Error(String(err));
+      if (!rawBase64) {
+        googleTtsCircuitOpenUntil = Date.now() + 30000;
       }
     }
 
@@ -299,15 +316,19 @@ app.post('/api/free-tts', async (req, res) => {
     }
 
     const audioChunks: string[] = [];
-    for (let i = 0; i < textChunks.length; i += 2) {
-      const batch = textChunks.slice(i, i + 2);
+    for (let i = 0; i < textChunks.length; i += 4) {
+      const batch = textChunks.slice(i, i + 4);
       const batchResults = await Promise.all(
         batch.map((chunk) => fetchTtsChunkWithFallback(chunk, tl, numPitch, numRate))
       );
       audioChunks.push(...batchResults);
     }
 
+    const audioId = crypto.randomUUID();
+    setTtsJobCache(audioId, audioChunks);
+
     return res.json({
+      audioId,
       chunks: audioChunks,
       mimeType: 'audio/mpeg',
       lang: tl,
@@ -320,21 +341,15 @@ app.post('/api/free-tts', async (req, res) => {
   }
 });
 
-// Universal MP4 (H.264 + AAC Stereo 44.1kHz) muxer & transcoder so exported video & audio work in EVERY external player
-app.post('/api/export-mp4', express.json({ limit: '250mb' }), async (req, res) => {
+async function muxVideoBufferToMp4(
+  videoBuffer: Buffer,
+  videoFormat: string,
+  validChunks: string[]
+): Promise<{ mp4Buffer: Buffer; hasAudioOutput: boolean }> {
   const tmpDir = path.join(os.tmpdir(), `tgstudio-export-${crypto.randomUUID()}`);
 
   try {
-    const { videoBase64, videoFormat = 'webm', audioChunks } = req.body || {};
-    if (!videoBase64 || typeof videoBase64 !== 'string') {
-      return res.status(400).json({ error: 'Dati video mancanti per esportazione MP4.' });
-    }
-
     await fs.promises.mkdir(tmpDir, { recursive: true });
-    const base64MarkerIdx = videoBase64.indexOf(';base64,');
-    const cleanVideoBase64 =
-      base64MarkerIdx >= 0 ? videoBase64.slice(base64MarkerIdx + 8) : videoBase64;
-    const videoBuffer = Buffer.from(cleanVideoBase64, 'base64');
 
     const isEbmlWebm =
       videoBuffer.length >= 4 &&
@@ -351,10 +366,6 @@ app.post('/api/export-mp4', express.json({ limit: '250mb' }), async (req, res) =
     const outputMp4Path = path.join(tmpDir, 'output.mp4');
 
     await fs.promises.writeFile(inputVideoPath, videoBuffer);
-
-    const validChunks = Array.isArray(audioChunks)
-      ? audioChunks.filter((c): c is string => typeof c === 'string' && c.length > 0)
-      : [];
 
     let hasAudioOutput = false;
 
@@ -435,6 +446,68 @@ app.post('/api/export-mp4', express.json({ limit: '250mb' }), async (req, res) =
     }
 
     const mp4Buffer = await fs.promises.readFile(outputMp4Path);
+    return { mp4Buffer, hasAudioOutput };
+  } finally {
+    fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+// Fast binary MP4 muxer endpoint (zero base64 overhead, zero FileReader memory spike)
+app.post('/api/export-mp4-bin', express.raw({ type: 'application/octet-stream', limit: '250mb' }), async (req, res) => {
+  try {
+    const videoBuffer = req.body;
+    if (!Buffer.isBuffer(videoBuffer) || videoBuffer.length === 0) {
+      return res.status(400).json({ error: 'Dati video binari mancanti.' });
+    }
+
+    const audioId = typeof req.query.audioId === 'string' ? req.query.audioId : '';
+    const videoFormat = typeof req.query.format === 'string' ? req.query.format : 'webm';
+    const cachedChunks = audioId ? ttsJobCache.get(audioId) : undefined;
+    if (audioId && !cachedChunks) {
+      return res.status(410).json({ error: 'Sessione audio scaduta, riprova con esportazione standard.' });
+    }
+
+    const { mp4Buffer, hasAudioOutput } = await muxVideoBufferToMp4(
+      videoBuffer,
+      videoFormat,
+      cachedChunks || []
+    );
+
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', String(mp4Buffer.length));
+    res.setHeader('X-Has-Audio', hasAudioOutput ? 'true' : 'false');
+    return res.send(mp4Buffer);
+  } catch (error: any) {
+    console.error('Errore /api/export-mp4-bin:', error);
+    return res.status(500).json({
+      error: error?.message || 'Errore durante la conversione MP4 con FFmpeg.',
+    });
+  }
+});
+
+// Universal MP4 (H.264 + AAC Stereo 44.1kHz) JSON fallback muxer
+app.post('/api/export-mp4', express.json({ limit: '250mb' }), async (req, res) => {
+  try {
+    const { videoBase64, videoFormat = 'webm', audioChunks } = req.body || {};
+    if (!videoBase64 || typeof videoBase64 !== 'string') {
+      return res.status(400).json({ error: 'Dati video mancanti per esportazione MP4.' });
+    }
+
+    const base64MarkerIdx = videoBase64.indexOf(';base64,');
+    const cleanVideoBase64 =
+      base64MarkerIdx >= 0 ? videoBase64.slice(base64MarkerIdx + 8) : videoBase64;
+    const videoBuffer = Buffer.from(cleanVideoBase64, 'base64');
+
+    const validChunks = Array.isArray(audioChunks)
+      ? audioChunks.filter((c): c is string => typeof c === 'string' && c.length > 0)
+      : [];
+
+    const { mp4Buffer, hasAudioOutput } = await muxVideoBufferToMp4(
+      videoBuffer,
+      videoFormat,
+      validChunks
+    );
+
     res.setHeader('Content-Type', 'video/mp4');
     res.setHeader('Content-Length', String(mp4Buffer.length));
     res.setHeader('X-Has-Audio', hasAudioOutput ? 'true' : 'false');
@@ -444,8 +517,6 @@ app.post('/api/export-mp4', express.json({ limit: '250mb' }), async (req, res) =
     return res.status(500).json({
       error: error?.message || 'Errore durante la conversione MP4 con FFmpeg.',
     });
-  } finally {
-    fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 });
 
