@@ -38,19 +38,18 @@ export class VideoRecorderManager {
 
     const candidateMimeTypes = addedAudioTrack
       ? [
-          'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
-          'video/mp4;codecs=avc1,mp4a.40.2',
-          'video/mp4',
           'video/webm;codecs=vp8,opus',
           'video/webm;codecs=vp9,opus',
           'video/webm',
+          'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+          'video/mp4',
         ]
       : [
-          'video/mp4;codecs=avc1.42E01E',
-          'video/mp4',
           'video/webm;codecs=vp8',
           'video/webm;codecs=vp9',
           'video/webm',
+          'video/mp4;codecs=avc1.42E01E',
+          'video/mp4',
         ];
 
     const supportedMime =
@@ -65,7 +64,7 @@ export class VideoRecorderManager {
         return {
           recorder: new MediaRecorder(combinedStream, {
             mimeType: supportedMime,
-            videoBitsPerSecond: 2_800_000,
+            videoBitsPerSecond: 2_200_000,
             ...(addedAudioTrack ? { audioBitsPerSecond: 128_000 } : {}),
           }),
           hasAudio: effectiveHasAudio,

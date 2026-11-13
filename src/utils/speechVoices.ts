@@ -199,3 +199,74 @@ export function splitTextIntoSpeechChunks(text: string, maxLen = 140): string[] 
 
   return chunks;
 }
+
+export interface StudioVoiceProfileOption {
+  id: string;
+  label: string;
+  pitchMult: number;
+  rateMult: number;
+}
+
+export const STUDIO_VOICE_PROFILES: StudioVoiceProfileOption[] = [
+  {
+    id: 'studio:female-news',
+    label: '★ Google Studio · Giornalista Donna (Chiaro · MP4 HD)',
+    pitchMult: 1.03,
+    rateMult: 1.0,
+  },
+  {
+    id: 'studio:male-anchor',
+    label: '★ Google Studio · Anchor Uomo (Caldo & Autorevole · MP4 HD)',
+    pitchMult: 0.88,
+    rateMult: 0.98,
+  },
+  {
+    id: 'studio:deep-breaking',
+    label: '★ Google Studio · Breaking News (Tono Profondo · MP4 HD)',
+    pitchMult: 0.81,
+    rateMult: 0.96,
+  },
+  {
+    id: 'studio:bright-fast',
+    label: '★ Google Studio · Flash News (Ritmo Veloce · MP4 HD)',
+    pitchMult: 1.05,
+    rateMult: 1.1,
+  },
+];
+
+export function resolveStudioVoiceParams(
+  selectedVoiceURI: string,
+  anchorGender: 'male' | 'female',
+  userPitch = 1.0,
+  userRate = 1.0
+): {
+  isStudioVoice: boolean;
+  pitch: number;
+  rate: number;
+} {
+  const isStudioVoice = !selectedVoiceURI || selectedVoiceURI.startsWith('studio:');
+  const matchedProfile = STUDIO_VOICE_PROFILES.find((p) => p.id === selectedVoiceURI);
+
+  let basePitch = anchorGender === 'male' ? 0.89 : 1.02;
+  let baseRate = 1.0;
+
+  if (matchedProfile) {
+    basePitch = matchedProfile.pitchMult;
+    baseRate = matchedProfile.rateMult;
+  } else if (selectedVoiceURI && !selectedVoiceURI.startsWith('studio:')) {
+    // If a browser voice was selected before clicking Record, mirror its gender hint into Studio TTS
+    if (matchesGenderHint(selectedVoiceURI, 'male')) {
+      basePitch = 0.88;
+    } else if (matchesGenderHint(selectedVoiceURI, 'female')) {
+      basePitch = 1.03;
+    }
+  }
+
+  const clamp = (val: number, min: number, max: number) => Math.max(min, Math.min(max, val));
+
+  return {
+    isStudioVoice,
+    pitch: Number(clamp(basePitch * userPitch, 0.72, 1.35).toFixed(2)),
+    rate: Number(clamp(baseRate * userRate, 0.78, 1.3).toFixed(2)),
+  };
+}

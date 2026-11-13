@@ -11,7 +11,11 @@ import { ANCHOR_PROFILES } from './constants/anchors';
 import { STUDIO_BACKGROUNDS, STUDIO_IMAGE_ASSETS } from './constants/backgrounds';
 import { globalAudioEngine } from './utils/audioAnalyzer';
 import { globalVideoRecorder, RecordingResult } from './utils/videoRecorder';
-import { resolveSystemVoice, splitTextIntoSpeechChunks } from './utils/speechVoices';
+import {
+  resolveSystemVoice,
+  resolveStudioVoiceParams,
+  splitTextIntoSpeechChunks,
+} from './utils/speechVoices';
 import { BroadcastCanvas } from './components/BroadcastCanvas';
 import { TopBar, ActiveStudioTab } from './components/TopBar';
 import { ScriptEditor } from './components/ScriptEditor';
@@ -100,11 +104,14 @@ export default function App() {
 
   // Playback & Voice state
   const [isPlayingSpeech, setIsPlayingSpeech] = useState(false);
+  const [isLoadingVoice, setIsLoadingVoice] = useState(false);
   const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
   const [testMouthOpen, setTestMouthOpen] = useState(false);
 
   // Video Recording state & synchronization refs
   const [isRecording, setIsRecording] = useState(false);
+  const [isPreparingRecording, setIsPreparingRecording] = useState(false);
+  const [isExportingMp4, setIsExportingMp4] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [recordingResult, setRecordingResult] = useState<RecordingResult | null>(null);
   const [isFinalizingCredits, setIsFinalizingCredits] = useState(false);
@@ -117,8 +124,7 @@ export default function App() {
   const speechSessionRef = useRef(0);
   const speechKeepAliveRef = useRef<number | null>(null);
   const chunkWatchdogRef = useRef<number | null>(null);
-  const capturedDisplayStreamRef = useRef<MediaStream | null>(null);
-  const fallbackAudioElRef = useRef<HTMLAudioElement | null>(null);
+  const recordedAudioChunksRef = useRef<string[]>([]);
 
   // Keep refs synchronized on every render to eliminate stale closures
   stateRef.current = state;
@@ -188,35 +194,73 @@ export default function App() {
     }
   };
 
-  const cleanupCapturedDisplayStream = useCallback(() => {
-    if (capturedDisplayStreamRef.current) {
-      capturedDisplayStreamRef.current.getTracks().forEach((t) => {
-        try {
-          t.stop();
-        } catch {
-          // Ignore
+  const blobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        if (typeof reader.result !== 'string') {
+          return reject(new Error('Impossibile leggere il flusso video registrato.'));
         }
+        const markerIdx = reader.result.indexOf(';base64,');
+        resolve(markerIdx >= 0 ? reader.result.slice(markerIdx + 8) : reader.result);
+      };
+      reader.onerror = () => reject(new Error('Errore di conversione file video.'));
+      // Force application/octet-stream so codec parameters like "vp8,opus" never confuse DataURL splitting
+      reader.readAsDataURL(new Blob([blob], { type: 'application/octet-stream' }));
+    });
+  };
+
+  const fetchRecordableStudioAudio = async (
+    text: string,
+    langTag: string,
+    pitch: number,
+    rate: number
+  ): Promise<string[]> => {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 90000);
+
+    try {
+      const resp = await fetch('/api/free-tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text, lang: langTag, pitch, rate }),
+        signal: controller.signal,
       });
-      capturedDisplayStreamRef.current = null;
+
+      if (!resp.ok) {
+        if (resp.status === 404) {
+          throw new Error(
+            'Servizio audio server (/api/free-tts) non raggiungibile su questo indirizzo statico (HTTP 404). Apri l’app dall’URL di sviluppo per esportare MP4 con audio vocale.'
+          );
+        }
+        const errBody = await resp.json().catch(() => ({}));
+        throw new Error(errBody?.error || `Errore generazione voce (HTTP ${resp.status}).`);
+      }
+
+      const data = await resp.json();
+      if (!Array.isArray(data?.chunks) || data.chunks.length === 0) {
+        throw new Error('Nessun blocco audio restituito dal servizio vocale.');
+      }
+
+      return data.chunks;
+    } catch (err: any) {
+      if (err?.name === 'AbortError') {
+        throw new Error('Timeout durante la sintesi vocale del copione.');
+      }
+      throw err;
+    } finally {
+      window.clearTimeout(timeoutId);
     }
-  }, []);
+  };
 
   const handleStopSpeech = () => {
     speechSessionRef.current += 1;
     clearSpeechKeepAlive();
     globalAudioEngine.stop();
-    if (fallbackAudioElRef.current) {
-      try {
-        fallbackAudioElRef.current.pause();
-        fallbackAudioElRef.current.src = '';
-      } catch {
-        // Ignore
-      }
-      fallbackAudioElRef.current = null;
-    }
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       window.speechSynthesis.cancel();
     }
+    setIsLoadingVoice(false);
     setIsPlayingSpeech(false);
   };
 
@@ -224,28 +268,21 @@ export default function App() {
     return () => {
       speechSessionRef.current += 1;
       clearSpeechKeepAlive();
-      cleanupCapturedDisplayStream();
-      if (fallbackAudioElRef.current) {
-        try {
-          fallbackAudioElRef.current.pause();
-          fallbackAudioElRef.current.src = '';
-        } catch {
-          // Ignore
-        }
-        fallbackAudioElRef.current = null;
-      }
+      globalAudioEngine.stop();
       if (typeof window !== 'undefined' && window.speechSynthesis) {
         window.speechSynthesis.cancel();
       }
     };
-  }, [cleanupCapturedDisplayStream]);
+  }, []);
 
-  // Pure client-side finishRecordingWithCredits: rolls End Credits on canvas and exports directly in browser
+  // Rolls End Credits on canvas and exports universal H.264 + AAC Stereo MP4 via FFmpeg
   const finishRecordingWithCredits = useCallback(async () => {
     if (isFinalizingRef.current) return;
     isFinalizingRef.current = true;
     setIsFinalizingCredits(true);
 
+    const activeRecordedChunks = [...recordedAudioChunksRef.current];
+    recordedAudioChunksRef.current = [];
     handleStopSpeech();
 
     const currentCredits = stateRef.current.endCredits;
@@ -255,107 +292,135 @@ export default function App() {
       await new Promise((r) => setTimeout(r, waitMs));
     }
 
+    let rawResult: RecordingResult | null = null;
     try {
       // Stop recorder WHILE credits slate is still displayed so video never flashes back to studio
-      const result = await globalVideoRecorder.stopRecording();
+      rawResult = await globalVideoRecorder.stopRecording();
       setState((prev) => ({ ...prev, showCreditsNow: false }));
       setIsRecording(false);
       isRecordingRef.current = false;
       setRecordingSeconds(0);
-      cleanupCapturedDisplayStream();
-      setRecordingResult(result);
+
+      setIsExportingMp4(true);
+      const videoBase64 = await blobToBase64(rawResult.blob);
+
+      const exportResp = await fetch('/api/export-mp4', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          videoBase64,
+          videoFormat: rawResult.format,
+          audioChunks: activeRecordedChunks,
+        }),
+      });
+
+      if (!exportResp.ok) {
+        const errData = await exportResp.json().catch(() => ({}));
+        throw new Error(errData?.error || `Errore conversione MP4 (HTTP ${exportResp.status})`);
+      }
+
+      const mp4Blob = await exportResp.blob();
+      const serverHasAudio = exportResp.headers.get('X-Has-Audio') === 'true';
+      const hasAudio = activeRecordedChunks.length > 0 || serverHasAudio || rawResult.hasAudio;
+
+      if (!mp4Blob || mp4Blob.size === 0) {
+        throw new Error('File MP4 generato vuoto.');
+      }
+
+      URL.revokeObjectURL(rawResult.url);
+      const mp4Url = URL.createObjectURL(mp4Blob);
+      setRecordingResult({
+        blob: mp4Blob,
+        url: mp4Url,
+        durationSec: rawResult.durationSec,
+        format: 'mp4',
+        sizeBytes: mp4Blob.size,
+        hasAudio,
+      });
     } catch (err: any) {
-      console.error('Errore finalizzazione video:', err);
+      console.error('Errore finalizzazione/esportazione MP4:', err);
       setState((prev) => ({ ...prev, showCreditsNow: false }));
-      setVoiceNotice(err?.message || 'Errore durante il salvataggio del video registrato.');
       setIsRecording(false);
       isRecordingRef.current = false;
       setRecordingSeconds(0);
-      cleanupCapturedDisplayStream();
+
+      if (rawResult && rawResult.hasAudio && activeRecordedChunks.length === 0) {
+        setRecordingResult(rawResult);
+        setVoiceNotice(
+          `Conversione MP4 non riuscita (${err?.message || 'errore FFmpeg'}). Scarica il file originale ${rawResult.format.toUpperCase()}.`
+        );
+      } else {
+        if (rawResult?.url) URL.revokeObjectURL(rawResult.url);
+        setVoiceNotice(err?.message || 'Errore durante la creazione del video MP4 con audio.');
+      }
     } finally {
+      setIsExportingMp4(false);
       setIsFinalizingCredits(false);
       isFinalizingRef.current = false;
     }
-  }, [cleanupCapturedDisplayStream]);
+  }, []);
 
-  // Direct client-side Google Translate <audio> player (only if browser has 0 Web Speech voices)
-  const playDirectGoogleAudioChunks = (sessionId: number, useLiveStreamForLipSync: boolean) => {
-    const langTag = currentLanguage.webSpeechLang || 'it-IT';
-    const tl = langTag.toLowerCase().startsWith('zh') ? 'zh-CN' : langTag.split('-')[0] || 'it';
-    const chunks = splitTextIntoSpeechChunks(stateRef.current.scriptText, 160);
-    if (chunks.length === 0) return;
-
-    const words = stateRef.current.scriptText.trim().split(/\s+/).length;
-    const estSec = Math.max(4, (words / 115) * 60) + 12;
-    setIsPlayingSpeech(true);
-    if (!useLiveStreamForLipSync) {
-      globalAudioEngine.startSpeechSimulation(estSec, handleAudioMetrics);
-    }
-
-    let idx = 0;
-    const finishAll = async () => {
-      if (speechSessionRef.current !== sessionId) return;
-      fallbackAudioElRef.current = null;
-      setIsPlayingSpeech(false);
-      globalAudioEngine.stop();
-      if (isRecordingRef.current || globalVideoRecorder.getIsRecording()) {
-        await finishRecordingWithCredits();
-      }
-    };
-
-    const next = () => {
-      if (speechSessionRef.current !== sessionId) return;
-      if (idx >= chunks.length) {
-        void finishAll();
-        return;
-      }
-      const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
-        chunks[idx]
-      )}&tl=${encodeURIComponent(tl)}&client=gtx`;
-      const audio = new Audio(url);
-      fallbackAudioElRef.current = audio;
-      audio.onended = () => {
-        if (speechSessionRef.current !== sessionId) return;
-        idx += 1;
-        next();
-      };
-      audio.onerror = () => {
-        if (speechSessionRef.current !== sessionId) return;
-        idx += 1;
-        next();
-      };
-      audio.play().catch(() => {
-        if (speechSessionRef.current !== sessionId) return;
-        idx += 1;
-        next();
-      });
-    };
-
-    next();
-  };
-
-  // Play Speech directly via browser Google Web Speech service (zero server dependency)
-  const handlePlaySpeech = () => {
+  // Play Speech: uses Studio Google TTS (via Web Audio + real FFT lip-sync) when Studio profile selected,
+  // or direct browser Google/Device voice when a browser voice is chosen.
+  const handlePlaySpeech = async () => {
     const text = stateRef.current.scriptText.trim();
     if (!text) return;
+
     setVoiceNotice(null);
-    playWebSpeech(false);
+    const { isStudioVoice, pitch, rate } = resolveStudioVoiceParams(
+      stateRef.current.selectedVoiceURI,
+      currentAnchor.gender,
+      stateRef.current.voicePitch ?? 1.0,
+      stateRef.current.voiceRate ?? 1.0
+    );
+
+    if (isStudioVoice) {
+      handleStopSpeech();
+      const sessionId = ++speechSessionRef.current;
+      setIsLoadingVoice(true);
+      globalAudioEngine.unlockAudio();
+
+      try {
+        const chunks = await fetchRecordableStudioAudio(
+          text,
+          currentLanguage.webSpeechLang,
+          pitch,
+          rate
+        );
+        if (speechSessionRef.current !== sessionId) return;
+
+        const buffers = await globalAudioEngine.decodeAudioChunksBase64(chunks);
+        if (speechSessionRef.current !== sessionId) return;
+
+        setIsLoadingVoice(false);
+        setIsPlayingSpeech(true);
+
+        await globalAudioEngine.playAudioBuffers(buffers, handleAudioMetrics, () => {
+          if (speechSessionRef.current !== sessionId) return;
+          setIsPlayingSpeech(false);
+        });
+        return;
+      } catch (err: any) {
+        if (speechSessionRef.current !== sessionId) return;
+        setIsLoadingVoice(false);
+        setVoiceNotice(
+          `${err?.message || 'Voce Google Studio non disponibile'}: passaggio alla voce locale del browser per l’anteprima.`
+        );
+        playWebSpeech();
+        return;
+      }
+    }
+
+    playWebSpeech();
   };
 
   // Chunked Google Web Speech player with Chromium keep-alive, pitch/rate, and anchor gender matching
-  const playWebSpeech = (useLiveStreamForLipSync = false) => {
+  const playWebSpeech = () => {
     const sessionId = ++speechSessionRef.current;
     clearSpeechKeepAlive();
 
     if (typeof window === 'undefined' || !window.speechSynthesis) {
-      playDirectGoogleAudioChunks(sessionId, useLiveStreamForLipSync);
-      return;
-    }
-
-    const availableVoices = window.speechSynthesis.getVoices() || [];
-    if (availableVoices.length === 0) {
-      // Headless/restricted browsers without local voices can still play direct Google TTS <audio>
-      playDirectGoogleAudioChunks(sessionId, useLiveStreamForLipSync);
+      setVoiceNotice('Sintesi vocale Web Speech non supportata su questo browser.');
       return;
     }
 
@@ -371,9 +436,7 @@ export default function App() {
     const estSec = Math.max(4, (words / 110) * 60) + 15;
 
     setIsPlayingSpeech(true);
-    if (!useLiveStreamForLipSync) {
-      globalAudioEngine.startSpeechSimulation(estSec, handleAudioMetrics);
-    }
+    globalAudioEngine.startSpeechSimulation(estSec, handleAudioMetrics);
 
     // Chromium/Linux/Android keep-alive prevents silent 15s pause freeze
     speechKeepAliveRef.current = window.setInterval(() => {
@@ -481,9 +544,10 @@ export default function App() {
     }
   };
 
-  // Toggle Video Recording: 100% client-side, zero server dependency
+  // Toggle Video Recording: fetches + decodes real Google Studio TTS audio BEFORE starting capture,
+  // records synchronized canvas + Web Audio + FFT lip-sync, and exports H.264 + AAC Stereo MP4.
   const handleToggleRecord = async () => {
-    if (isPreparingRecordingRef.current) return;
+    if (isPreparingRecordingRef.current || isExportingMp4) return;
 
     if (isRecording || isFinalizingCredits) {
       await finishRecordingWithCredits();
@@ -504,69 +568,70 @@ export default function App() {
     }
 
     isPreparingRecordingRef.current = true;
+    setIsPreparingRecording(true);
     setVoiceNotice(null);
 
     try {
       handleStopSpeech();
-      cleanupCapturedDisplayStream();
       updateState({ showCreditsNow: false });
 
-      let capturedAudioStream: MediaStream | null = null;
-      let hasRealAudio = false;
+      // Unlock Web Audio right inside click gesture
+      const audioStream = await globalAudioEngine.ensureAudioReady();
 
-      // Capture current tab audio directly via browser getDisplayMedia (if permitted)
-      if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getDisplayMedia) {
-        try {
-          const displayStream = await navigator.mediaDevices.getDisplayMedia({
-            video: true,
-            audio: true,
-            preferCurrentTab: true,
-            selfBrowserSurface: 'include',
-            systemAudio: 'include',
-          } as any);
+      const { pitch, rate } = resolveStudioVoiceParams(
+        stateRef.current.selectedVoiceURI,
+        currentAnchor.gender,
+        stateRef.current.voicePitch ?? 1.0,
+        stateRef.current.voiceRate ?? 1.0
+      );
 
-          // Discard display video track; we record the crisp 1080p BroadcastCanvas instead
-          displayStream.getVideoTracks().forEach((t) => t.stop());
-
-          const audioTracks = displayStream.getAudioTracks();
-          if (audioTracks.length > 0) {
-            capturedAudioStream = new MediaStream(audioTracks);
-            capturedDisplayStreamRef.current = capturedAudioStream;
-            hasRealAudio = true;
-          }
-        } catch {
-          // Tab audio capture declined or blocked by iframe Permissions-Policy; continue without blocking
-        }
-      }
+      const audioChunks = await fetchRecordableStudioAudio(
+        text,
+        currentLanguage.webSpeechLang,
+        pitch,
+        rate
+      );
+      const audioBuffers = await globalAudioEngine.decodeAudioChunksBase64(audioChunks);
+      recordedAudioChunksRef.current = audioChunks;
 
       const started = globalVideoRecorder.startRecording(
         canvas,
-        capturedAudioStream,
+        audioStream,
         (secs) => setRecordingSeconds(secs),
-        hasRealAudio
+        true
       );
 
       if (!started) {
-        cleanupCapturedDisplayStream();
+        recordedAudioChunksRef.current = [];
         setVoiceNotice('Impossibile avviare la registrazione video su questo browser.');
         return;
       }
 
       setTestMouthOpen(false);
+      isPreparingRecordingRef.current = false;
+      setIsPreparingRecording(false);
       isRecordingRef.current = true;
       setIsRecording(true);
 
-      if (hasRealAudio && capturedAudioStream) {
-        await globalAudioEngine.startExternalStreamAnalysis(capturedAudioStream, handleAudioMetrics);
-        playWebSpeech(true);
-      } else {
-        setVoiceNotice(
-          'Audio della scheda non condiviso o bloccato dall’anteprima iframe: il video registra la sincronizzazione labiale. Per includere la voce Google dentro al file video senza server, apri l’app in una scheda browser dedicata e seleziona «Condividi audio scheda».'
-        );
-        playWebSpeech(false);
-      }
+      const recSessionId = ++speechSessionRef.current;
+      setIsPlayingSpeech(true);
+
+      await globalAudioEngine.playAudioBuffers(audioBuffers, handleAudioMetrics, () => {
+        if (speechSessionRef.current !== recSessionId) return;
+        setIsPlayingSpeech(false);
+        if (isRecordingRef.current || globalVideoRecorder.getIsRecording()) {
+          void finishRecordingWithCredits();
+        }
+      });
+    } catch (err: any) {
+      console.error('Errore avvio registrazione con audio:', err);
+      recordedAudioChunksRef.current = [];
+      setVoiceNotice(
+        err?.message || 'Impossibile generare la traccia audio vocale per la registrazione video.'
+      );
     } finally {
       isPreparingRecordingRef.current = false;
+      setIsPreparingRecording(false);
     }
   };
 
@@ -587,6 +652,8 @@ export default function App() {
         recordingSeconds={recordingSeconds}
         onToggleRecord={handleToggleRecord}
         isFinalizing={isFinalizingCredits}
+        isPreparingRecording={isPreparingRecording}
+        isExportingMp4={isExportingMp4}
       />
 
       {/* Main Studio Workspace */}
@@ -646,20 +713,24 @@ export default function App() {
               ) : (
                 <button
                   onClick={handlePlaySpeech}
-                  disabled={isFinalizingCredits}
+                  disabled={isFinalizingCredits || isLoadingVoice || isPreparingRecording || isExportingMp4}
                   className="px-3.5 py-1.5 font-bold text-white bg-emerald-600 hover:bg-emerald-500 rounded-lg transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-50"
                 >
                   <Play className="w-3.5 h-3.5 fill-current" />
-                  <span>Ascolta Notiziario</span>
+                  <span>{isLoadingVoice ? 'Caricamento Voce...' : 'Ascolta Notiziario'}</span>
                 </button>
               )}
 
               <button
                 onClick={handleToggleRecord}
-                disabled={isFinalizingCredits}
+                disabled={isFinalizingCredits || isPreparingRecording || isExportingMp4}
                 className={`px-3.5 py-1.5 font-bold rounded-lg transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-70 ${
-                  isFinalizingCredits
+                  isExportingMp4
+                    ? 'bg-emerald-700 text-white'
+                    : isFinalizingCredits
                     ? 'bg-amber-600 text-white'
+                    : isPreparingRecording
+                    ? 'bg-sky-700 text-white'
                     : isRecording
                     ? 'bg-rose-600 text-white'
                     : 'bg-sky-600 hover:bg-sky-500 text-white'
@@ -667,8 +738,12 @@ export default function App() {
               >
                 <Video className="w-3.5 h-3.5" />
                 <span>
-                  {isFinalizingCredits
+                  {isExportingMp4
+                    ? 'Creazione MP4...'
+                    : isFinalizingCredits
                     ? 'Titoli di Coda in Corso...'
+                    : isPreparingRecording
+                    ? 'Preparazione Audio...'
                     : isRecording
                     ? 'Termina Registrazione'
                     : 'Registra Notiziario'}
@@ -814,7 +889,7 @@ export default function App() {
                 isPlaying={isPlayingSpeech}
                 onPlaySpeech={handlePlaySpeech}
                 onStopSpeech={handleStopSpeech}
-                isLoadingVoice={false}
+                isLoadingVoice={isLoadingVoice}
                 currentLanguage={currentLanguage}
                 onSelectLanguage={handleSelectLanguage}
               />
@@ -846,7 +921,7 @@ export default function App() {
               isPlaying={isPlayingSpeech}
               onPlaySpeech={handlePlaySpeech}
               onStopSpeech={handleStopSpeech}
-              isLoadingVoice={false}
+              isLoadingVoice={isLoadingVoice}
               currentLanguage={currentLanguage}
               onSelectLanguage={handleSelectLanguage}
             />

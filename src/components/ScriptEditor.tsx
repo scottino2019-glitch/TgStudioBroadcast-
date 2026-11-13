@@ -1,11 +1,15 @@
 import React, { useEffect, useState } from 'react';
 import { BroadcastState, LanguageOption } from '../types';
 import { LANGUAGES } from '../constants/languages';
+import { ANCHOR_PROFILES } from '../constants/anchors';
 import {
   SystemVoiceItem,
+  STUDIO_VOICE_PROFILES,
   getAllSystemVoices,
   resolveSystemVoice,
+  resolveStudioVoiceParams,
 } from '../utils/speechVoices';
+import { globalAudioEngine } from '../utils/audioAnalyzer';
 import {
   Globe,
   Mic,
@@ -42,6 +46,9 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
   const [voices, setVoices] = useState<SystemVoiceItem[]>([]);
   const [isTestingVoice, setIsTestingVoice] = useState(false);
 
+  const activeAnchor =
+    ANCHOR_PROFILES.find((a) => a.id === state.currentAnchorId) || ANCHOR_PROFILES[0];
+
   const loadVoices = () => {
     const list = getAllSystemVoices();
     setVoices(list);
@@ -76,14 +83,60 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
     };
   }, []);
 
-  const handleTestVoice = () => {
+  const handleTestVoice = async () => {
     const sampleLine =
       state.scriptText.trim().split(/[.!?]/)[0]?.trim() ||
       currentLanguage.sampleScript.split(/[.!?]/)[0]?.trim() ||
       'Buonasera e benvenuti al telegiornale.';
 
+    const testSnippet = sampleLine.slice(0, 140);
+    const { isStudioVoice, pitch, rate } = resolveStudioVoiceParams(
+      state.selectedVoiceURI,
+      activeAnchor.gender,
+      state.voicePitch ?? 1.0,
+      state.voiceRate ?? 1.0
+    );
+
+    if (isStudioVoice) {
+      setIsTestingVoice(true);
+      setStatusMessage(null);
+      globalAudioEngine.unlockAudio();
+
+      try {
+        const controller = new AbortController();
+        const timeoutId = window.setTimeout(() => controller.abort(), 12000);
+        const resp = await fetch('/api/free-tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: testSnippet,
+            lang: currentLanguage.webSpeechLang,
+            pitch,
+            rate,
+          }),
+          signal: controller.signal,
+        });
+        window.clearTimeout(timeoutId);
+
+        if (resp.ok) {
+          const data = await resp.json();
+          if (Array.isArray(data?.chunks) && data.chunks.length > 0) {
+            await globalAudioEngine.playAudioChunksBase64(
+              data.chunks,
+              () => {},
+              () => setIsTestingVoice(false)
+            );
+            return;
+          }
+        }
+      } catch {
+        // Fallback smoothly to browser Web Speech if /api/free-tts cannot be reached
+      }
+      setIsTestingVoice(false);
+    }
+
     if (typeof window === 'undefined' || !window.speechSynthesis) {
-      setStatusMessage('Sintesi vocale Web Speech non disponibile su questo browser.');
+      setStatusMessage('Sintesi vocale non disponibile su questo browser.');
       return;
     }
 
@@ -91,8 +144,12 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
     window.speechSynthesis.cancel();
 
     const startTest = () => {
-      const utterance = new SpeechSynthesisUtterance(sampleLine.slice(0, 140));
-      const chosen = resolveSystemVoice(state.selectedVoiceURI, currentLanguage.webSpeechLang);
+      const utterance = new SpeechSynthesisUtterance(testSnippet);
+      const chosen = resolveSystemVoice(
+        state.selectedVoiceURI,
+        currentLanguage.webSpeechLang,
+        activeAnchor.gender
+      );
 
       if (chosen) {
         utterance.voice = chosen;
@@ -117,7 +174,6 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
     }
   };
 
-  const autoMatchedVoice = resolveSystemVoice('', currentLanguage.webSpeechLang);
   const googleVoicesCount = voices.filter((v) => v.isGoogle).length;
 
   // Approximate reading duration
@@ -224,13 +280,13 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
           </div>
         </div>
 
-        {/* Pure Browser Google Voice Selector (Zero Server Dependency) */}
+        {/* Google Studio MP4 Voices + Device Voices */}
         <div className="pt-3 border-t border-slate-800/80 space-y-3">
           <div className="flex items-center justify-between gap-2">
             <div className="flex items-center gap-2">
               <Volume2 className="w-4 h-4 text-emerald-400" />
               <span className="text-xs font-semibold text-slate-200">
-                Voci Google & Dispositivo ({voices.length} totali{googleVoicesCount > 0 ? ` · ${googleVoicesCount} Google` : ''})
+                Voci Google Studio (MP4){voices.length > 0 ? ` + ${voices.length} Browser` : ''}{googleVoicesCount > 0 ? ` (${googleVoicesCount} Google)` : ''}
               </span>
             </div>
 
@@ -238,7 +294,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
               type="button"
               onClick={() => {
                 const refreshed = loadVoices();
-                setStatusMessage(`Rilevate ${refreshed.length} voci dirette dal browser/dispositivo.`);
+                setStatusMessage(`Aggiornate ${STUDIO_VOICE_PROFILES.length + 1} voci Google Studio + ${refreshed.length} voci dispositivo.`);
                 setTimeout(() => setStatusMessage(null), 2500);
               }}
               className="px-2.5 py-1 text-[11px] text-slate-300 hover:text-white bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-lg transition-colors flex items-center gap-1.5"
@@ -255,14 +311,25 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
               onChange={(e) => onChange({ selectedVoiceURI: e.target.value })}
               className="flex-1 bg-slate-950 border border-slate-700/80 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
             >
-              <option value="">
-                Automatica Google ({autoMatchedVoice ? `${autoMatchedVoice.name} · ${autoMatchedVoice.lang}` : currentLanguage.webSpeechLang})
-              </option>
-              {voices.map((v) => (
-                <option key={v.key} value={v.key}>
-                  {v.isGoogle ? `★ ${v.name}` : v.name} ({v.lang})
+              <optgroup label="Voci Google Studio (Registrate sempre nei Video MP4 HD)">
+                <option value="">
+                  Google Studio Auto · Adatta a {activeAnchor.name} ({currentLanguage.name})
                 </option>
-              ))}
+                {STUDIO_VOICE_PROFILES.map((prof) => (
+                  <option key={prof.id} value={prof.id}>
+                    {prof.label}
+                  </option>
+                ))}
+              </optgroup>
+              {voices.length > 0 && (
+                <optgroup label="Voci Browser / Dispositivo (Ascolto Anteprima)">
+                  {voices.map((v) => (
+                    <option key={v.key} value={v.key}>
+                      {v.isGoogle ? `★ ${v.name}` : v.name} ({v.lang})
+                    </option>
+                  ))}
+                </optgroup>
+              )}
             </select>
 
             <button
@@ -315,7 +382,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
           </div>
 
           <p className="text-[11px] text-slate-400 leading-relaxed">
-            Sintesi diretta tramite il servizio voci Google del browser (senza server né blocchi). Seleziona qualsiasi voce sopra o regola il timbro per differenziare ogni conduttore.
+            I profili <strong>Google Studio</strong> applicano automaticamente la voce al file <strong>MP4 (H.264 + AAC)</strong> esportato con sincronizzazione labiale reale. Usa i cursori Timbro e Velocità per personalizzare ogni conduttore.
           </p>
         </div>
       </div>
