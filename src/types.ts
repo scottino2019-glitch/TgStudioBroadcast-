@@ -6,14 +6,11 @@ export interface LanguageOption {
   nativeName: string;
   group: LanguageGroup;
   flag: string;
-  defaultVoice: string; // Gemini prebuilt voice
-  webSpeechLang: string; // BCP 47 tag for fallback
+  webSpeechLang: string; // BCP 47 tag
   sampleHeadline: string;
   sampleScript: string;
   sampleTicker: string;
 }
-
-export type PrebuiltVoice = 'Kore' | 'Puck' | 'Fenrir' | 'Zephyr' | 'Charon';
 
 export interface AnchorProfile {
   id: string;
@@ -26,7 +23,6 @@ export interface AnchorProfile {
   customImageUrl?: string;
   // Calibration for custom photo
   mouthPosition?: { x: number; y: number; scale: number };
-  defaultVoice: PrebuiltVoice;
   accentColor: string;
 }
 
@@ -89,10 +85,7 @@ export interface BroadcastState {
   customBgUrl: string | null;
   selectedLanguage: string;
   scriptText: string;
-  selectedVoice: PrebuiltVoice;
   selectedVoiceURI: string;
-  voiceStyle: string;
-  speechEngine: 'browser';
   pip: PipGraphic;
   lowerThird: LowerThirdConfig;
   ticker: TickerConfig;

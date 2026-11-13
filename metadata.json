@@ -1,6 +1,5 @@
 {
   "name": "TG Studio - AI News Anchor & Video Creator",
-  "description": "Crea video stile notiziario con avatar parlante, sincronizzazione labiale accurata, sintesi vocale Google TTS multilingue (occidentale, orientale, slava), sfondi e grafiche personalizzate.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "description": "Crea video stile notiziario con avatar parlante, sincronizzazione labiale accurata, sintesi vocale multilingue (occidentale, orientale, slava), sfondi e grafiche personalizzate.",
+  "requestFramePermissions": []
 }

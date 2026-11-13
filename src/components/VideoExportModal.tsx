@@ -1,7 +1,7 @@
 import React, { useEffect } from 'react';
 import { RecordingResult } from '../utils/videoRecorder';
 import confetti from 'canvas-confetti';
-import { Download, Film, X, CheckCircle2, Play } from 'lucide-react';
+import { Download, X, CheckCircle2, Volume2, VolumeX } from 'lucide-react';
 
 interface VideoExportModalProps {
   result: RecordingResult | null;
@@ -24,6 +24,15 @@ export const VideoExportModal: React.FC<VideoExportModalProps> = ({ result, onCl
     }
   }, [result]);
 
+  useEffect(() => {
+    const urlToRevoke = result?.url;
+    return () => {
+      if (urlToRevoke) {
+        URL.revokeObjectURL(urlToRevoke);
+      }
+    };
+  }, [result?.url]);
+
   if (!result) return null;
 
   const fileSizeMb = (result.sizeBytes / (1024 * 1024)).toFixed(2);
@@ -39,7 +48,11 @@ export const VideoExportModal: React.FC<VideoExportModalProps> = ({ result, onCl
             </div>
             <div>
               <h2 className="text-base font-bold text-slate-100">Video Notiziario Pronto per l'Esportazione</h2>
-              <p className="text-xs text-slate-400">Audio sintetico naturale e sincronizzazione labiale completata</p>
+              <p className="text-xs text-slate-400">
+                {result.hasAudio
+                  ? 'Traccia audio vocale integrata e sincronizzazione labiale completata'
+                  : 'Registrazione video completata (senza traccia audio)'}
+              </p>
             </div>
           </div>
           <button
@@ -54,26 +67,47 @@ export const VideoExportModal: React.FC<VideoExportModalProps> = ({ result, onCl
         <div className="p-6 space-y-4 overflow-y-auto">
           <div className="aspect-video w-full rounded-xl overflow-hidden bg-black border border-slate-800 shadow-inner">
             <video
+              key={result.url}
               src={result.url}
               controls
-              autoPlay
+              playsInline
               className="w-full h-full object-contain"
             />
           </div>
 
           {/* Video Metadata Cards */}
-          <div className="grid grid-cols-3 gap-3 text-center">
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 text-center">
             <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
               <div className="text-[11px] text-slate-400 font-medium">Risoluzione</div>
               <div className="text-sm font-bold text-slate-200 font-data">1080p Full HD</div>
             </div>
             <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-              <div className="text-[11px] text-slate-400 font-medium">Durata Notiziario</div>
+              <div className="text-[11px] text-slate-400 font-medium">Durata</div>
               <div className="text-sm font-bold text-emerald-400 font-data">{result.durationSec}s</div>
             </div>
             <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
-              <div className="text-[11px] text-slate-400 font-medium">Dimensione File</div>
+              <div className="text-[11px] text-slate-400 font-medium">Dimensione</div>
               <div className="text-sm font-bold text-sky-400 font-data">{fileSizeMb} MB</div>
+            </div>
+            <div className="bg-slate-950 p-3 rounded-lg border border-slate-800">
+              <div className="text-[11px] text-slate-400 font-medium">Traccia Audio</div>
+              <div
+                className={`text-sm font-bold font-data flex items-center justify-center gap-1.5 ${
+                  result.hasAudio ? 'text-emerald-400' : 'text-amber-400'
+                }`}
+              >
+                {result.hasAudio ? (
+                  <>
+                    <Volume2 className="w-4 h-4" />
+                    <span>Inclusa</span>
+                  </>
+                ) : (
+                  <>
+                    <VolumeX className="w-4 h-4" />
+                    <span>Assente</span>
+                  </>
+                )}
+              </div>
             </div>
           </div>
         </div>

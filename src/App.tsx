@@ -36,10 +36,7 @@ export default function App() {
     customBgUrl: null,
     selectedLanguage: initialLang.code,
     scriptText: initialLang.sampleScript,
-    selectedVoice: 'Kore',
     selectedVoiceURI: '',
-    voiceStyle: 'Clear, authoritative TV news anchor with crisp articulation and television cadence',
-    speechEngine: 'browser',
     pip: {
       enabled: true,
       imageUrl: STUDIO_IMAGE_ASSETS.global,
@@ -107,16 +104,20 @@ export default function App() {
 
   // Video Recording state & synchronization refs
   const [isRecording, setIsRecording] = useState(false);
+  const [isPreparingRecording, setIsPreparingRecording] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [recordingResult, setRecordingResult] = useState<RecordingResult | null>(null);
   const [isFinalizingCredits, setIsFinalizingCredits] = useState(false);
 
   const canvasElementRef = useRef<HTMLCanvasElement | null>(null);
   const isRecordingRef = useRef(false);
+  const isPreparingRecordingRef = useRef(false);
   const stateRef = useRef(state);
   const isFinalizingRef = useRef(false);
   const speechSessionRef = useRef(0);
   const speechKeepAliveRef = useRef<number | null>(null);
+  const chunkWatchdogRef = useRef<number | null>(null);
+  const ttsAbortRef = useRef<AbortController | null>(null);
 
   // Keep refs synchronized on every render to eliminate stale closures
   stateRef.current = state;
@@ -163,8 +164,7 @@ export default function App() {
       ...prev,
       selectedLanguage: lang.code,
       scriptText: lang.sampleScript,
-      selectedVoice: lang.defaultVoice as any,
-      selectedVoiceURI: '', // Auto-pick best Google / Android voice for new language
+      selectedVoiceURI: '', // Auto-pick Google Studio Audio for new language
       lowerThird: {
         ...prev.lowerThird,
         headline: lang.sampleHeadline,
@@ -181,21 +181,34 @@ export default function App() {
       window.clearInterval(speechKeepAliveRef.current);
       speechKeepAliveRef.current = null;
     }
+    if (chunkWatchdogRef.current !== null) {
+      window.clearTimeout(chunkWatchdogRef.current);
+      chunkWatchdogRef.current = null;
+    }
   };
 
   const handleStopSpeech = () => {
     speechSessionRef.current += 1;
+    if (ttsAbortRef.current) {
+      ttsAbortRef.current.abort();
+      ttsAbortRef.current = null;
+    }
     clearSpeechKeepAlive();
     globalAudioEngine.stop();
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       window.speechSynthesis.cancel();
     }
+    setIsLoadingVoice(false);
     setIsPlayingSpeech(false);
   };
 
   useEffect(() => {
     return () => {
       speechSessionRef.current += 1;
+      if (ttsAbortRef.current) {
+        ttsAbortRef.current.abort();
+        ttsAbortRef.current = null;
+      }
       clearSpeechKeepAlive();
       if (typeof window !== 'undefined' && window.speechSynthesis) {
         window.speechSynthesis.cancel();
@@ -238,34 +251,28 @@ export default function App() {
     }
   }, []);
 
-  // Play Speech: uses recordable native Google Studio Audio by default (or chosen browser voice when selected)
-  const handlePlaySpeech = async () => {
-    const text = stateRef.current.scriptText.trim();
-    if (!text) return;
-
-    setVoiceNotice(null);
-    globalAudioEngine.unlockAudio();
-
-    // If user explicitly selected a browser/device Web Speech voice, play it directly without modifications
-    if (stateRef.current.selectedVoiceURI) {
-      playWebSpeech();
-      return;
+  const fetchRecordableStudioBuffers = async (
+    text: string,
+    webSpeechLang: string,
+    sessionId: number
+  ): Promise<AudioBuffer[]> => {
+    if (ttsAbortRef.current) {
+      ttsAbortRef.current.abort();
     }
-
-    const sessionId = ++speechSessionRef.current;
-    setIsLoadingVoice(true);
+    const controller = new AbortController();
+    ttsAbortRef.current = controller;
+    const timeoutId = window.setTimeout(() => controller.abort(), 15000);
 
     try {
       const res = await fetch('/api/free-tts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           text,
-          lang: currentLanguage.webSpeechLang,
+          lang: webSpeechLang,
         }),
       });
-
-      if (speechSessionRef.current !== sessionId) return;
 
       if (!res.ok) {
         throw new Error(`HTTP ${res.status}`);
@@ -276,13 +283,50 @@ export default function App() {
         throw new Error('Audio non ricevuto');
       }
 
+      if (speechSessionRef.current !== sessionId) {
+        throw new Error('Sessione interrotta');
+      }
+
+      return await globalAudioEngine.decodeAudioChunksBase64(data.chunks);
+    } finally {
+      window.clearTimeout(timeoutId);
+      if (ttsAbortRef.current === controller) {
+        ttsAbortRef.current = null;
+      }
+    }
+  };
+
+  // Play Speech: uses recordable native Google Studio Audio by default (or chosen browser voice when selected)
+  const handlePlaySpeech = async () => {
+    const text = stateRef.current.scriptText.trim();
+    if (!text) return;
+
+    setVoiceNotice(null);
+    globalAudioEngine.unlockAudio();
+
+    // If user explicitly selected a browser/device Web Speech voice, play it directly for listening
+    if (stateRef.current.selectedVoiceURI) {
+      playWebSpeech();
+      return;
+    }
+
+    const sessionId = ++speechSessionRef.current;
+    setIsLoadingVoice(true);
+
+    try {
+      const buffers = await fetchRecordableStudioBuffers(
+        text,
+        currentLanguage.webSpeechLang,
+        sessionId
+      );
+
       if (speechSessionRef.current !== sessionId) return;
 
       setIsPlayingSpeech(true);
       setIsLoadingVoice(false);
 
-      await globalAudioEngine.playAudioChunksBase64(
-        data.chunks,
+      await globalAudioEngine.playAudioBuffers(
+        buffers,
         handleAudioMetrics,
         () => {
           if (speechSessionRef.current !== sessionId) return;
@@ -292,18 +336,20 @@ export default function App() {
           }
         }
       );
-    } catch (err) {
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || speechSessionRef.current !== sessionId) {
+        setIsLoadingVoice(false);
+        return;
+      }
       console.warn('Fallback a Web Speech locale:', err);
       if (speechSessionRef.current === sessionId) {
         setIsLoadingVoice(false);
         playWebSpeech();
       }
-    } finally {
-      setIsLoadingVoice(false);
     }
   };
 
-  // Chunked Web Speech player for reliable Google / Android playback of any script length
+  // Chunked Web Speech player with Chromium keep-alive and watchdog so it never hangs
   const playWebSpeech = () => {
     if (typeof window === 'undefined' || !window.speechSynthesis) {
       setVoiceNotice('Sintesi vocale Web Speech non disponibile su questo browser.');
@@ -318,11 +364,10 @@ export default function App() {
       window.speechSynthesis.cancel();
     }
 
-    const chunks = splitTextIntoSpeechChunks(state.scriptText);
+    const chunks = splitTextIntoSpeechChunks(stateRef.current.scriptText);
     if (chunks.length === 0) return;
 
-    // Generous max duration for lip-sync simulation; stopped explicitly when final chunk ends
-    const words = state.scriptText.trim().split(/\s+/).length;
+    const words = stateRef.current.scriptText.trim().split(/\s+/).length;
     const estSec = Math.max(4, (words / 110) * 60) + 15;
 
     setIsPlayingSpeech(true);
@@ -330,6 +375,18 @@ export default function App() {
       estSec,
       handleAudioMetrics
     );
+
+    // Chromium/Linux/Android keep-alive prevents silent 15s pause freeze
+    speechKeepAliveRef.current = window.setInterval(() => {
+      if (speechSessionRef.current !== sessionId) return;
+      try {
+        if (window.speechSynthesis.paused) {
+          window.speechSynthesis.resume();
+        }
+      } catch {
+        // Ignore
+      }
+    }, 3500);
 
     let chunkIndex = 0;
 
@@ -345,28 +402,38 @@ export default function App() {
 
     const speakNextChunk = () => {
       if (speechSessionRef.current !== sessionId) return;
+      if (chunkWatchdogRef.current !== null) {
+        window.clearTimeout(chunkWatchdogRef.current);
+        chunkWatchdogRef.current = null;
+      }
+
       if (chunkIndex >= chunks.length) {
         void finishAllChunks();
         return;
       }
 
-      // Resolve fresh on first/each chunk in case voices loaded asynchronously
+      const chunkText = chunks[chunkIndex];
       const chosenVoice = resolveSystemVoice(
         stateRef.current.selectedVoiceURI,
         currentLanguage.webSpeechLang
       );
 
-      const utterance = new SpeechSynthesisUtterance(chunks[chunkIndex]);
+      const utterance = new SpeechSynthesisUtterance(chunkText);
       if (chosenVoice) {
         utterance.voice = chosenVoice;
         utterance.lang = chosenVoice.lang || currentLanguage.webSpeechLang;
       } else {
-        // Let the OS / Android TTS engine pick the native voice for target language (e.g. it-IT)
         utterance.lang = currentLanguage.webSpeechLang;
       }
 
-      utterance.onend = () => {
-        if (speechSessionRef.current !== sessionId) return;
+      let settled = false;
+      const onChunkDone = () => {
+        if (settled || speechSessionRef.current !== sessionId) return;
+        settled = true;
+        if (chunkWatchdogRef.current !== null) {
+          window.clearTimeout(chunkWatchdogRef.current);
+          chunkWatchdogRef.current = null;
+        }
         chunkIndex += 1;
         if (chunkIndex < chunks.length) {
           speakNextChunk();
@@ -375,22 +442,31 @@ export default function App() {
         }
       };
 
+      utterance.onend = onChunkDone;
       utterance.onerror = (ev) => {
         if (speechSessionRef.current !== sessionId) return;
         if (ev.error === 'interrupted' || ev.error === 'canceled') return;
         console.warn('Errore chunk Web Speech:', ev.error);
-        chunkIndex += 1;
-        if (chunkIndex < chunks.length) {
-          speakNextChunk();
-        } else {
-          void finishAllChunks();
-        }
+        onChunkDone();
       };
+
+      // Watchdog ensures a missed onend event never locks the app
+      const maxChunkMs = Math.max(10000, chunkText.length * 160 + 4000);
+      chunkWatchdogRef.current = window.setTimeout(() => {
+        if (!settled && speechSessionRef.current === sessionId) {
+          console.warn('Timeout chunk Web Speech, passaggio al blocco successivo.');
+          try {
+            window.speechSynthesis.cancel();
+          } catch {
+            // Ignore
+          }
+          onChunkDone();
+        }
+      }, maxChunkMs);
 
       window.speechSynthesis.speak(utterance);
     };
 
-    // Avoid Chromium race where synchronous cancel() cancels a newly queued utterance
     if (wasBusy) {
       window.setTimeout(() => {
         if (speechSessionRef.current === sessionId) {
@@ -402,36 +478,91 @@ export default function App() {
     }
   };
 
-  // Toggle Video Recording
+  // Toggle Video Recording: pre-fetches & decodes recordable audio BEFORE MediaRecorder starts
   const handleToggleRecord = async () => {
+    if (isPreparingRecordingRef.current) return;
+
     if (isRecording || isFinalizingCredits) {
-      // Stop recording and capture end credits slate
       await finishRecordingWithCredits();
-    } else {
-      // Start recording
-      const canvas = canvasElementRef.current;
-      if (!canvas) return;
-      if (typeof canvas.captureStream !== 'function' || typeof MediaRecorder === 'undefined') {
-        setVoiceNotice('La registrazione video diretta dal browser non è supportata su questo dispositivo.');
+      return;
+    }
+
+    const canvas = canvasElementRef.current;
+    if (!canvas) return;
+    if (typeof canvas.captureStream !== 'function' || typeof MediaRecorder === 'undefined') {
+      setVoiceNotice('La registrazione video diretta dal browser non è supportata su questo dispositivo.');
+      return;
+    }
+
+    const text = stateRef.current.scriptText.trim();
+    if (!text) {
+      setVoiceNotice('Inserisci il testo del copione prima di avviare la registrazione video.');
+      return;
+    }
+
+    isPreparingRecordingRef.current = true;
+    setIsPreparingRecording(true);
+    setVoiceNotice(null);
+
+    try {
+      handleStopSpeech();
+      updateState({ showCreditsNow: false });
+
+      // Ensure AudioContext is unlocked & running BEFORE grabbing MediaStream for MediaRecorder
+      const audioStream = await globalAudioEngine.ensureAudioReady();
+      const sessionId = ++speechSessionRef.current;
+
+      if (stateRef.current.selectedVoiceURI) {
+        setVoiceNotice(
+          'Per includere l’audio nel file video esportato, la registrazione usa Google Studio Audio al posto della voce di sistema.'
+        );
+      }
+
+      let buffers: AudioBuffer[] = [];
+      try {
+        buffers = await fetchRecordableStudioBuffers(
+          text,
+          currentLanguage.webSpeechLang,
+          sessionId
+        );
+      } catch (audioErr: any) {
+        console.error('Impossibile preparare audio registrabile:', audioErr);
+        setVoiceNotice(
+          'Audio TTS non raggiungibile al momento: impossibile registrare la voce nel video. Controlla la connessione o riprova.'
+        );
         return;
       }
 
-      updateState({ showCreditsNow: false });
-      const audioStream = globalAudioEngine.getAudioStream();
+      if (speechSessionRef.current !== sessionId) return;
+
       const started = globalVideoRecorder.startRecording(canvas, audioStream, (secs) => {
         setRecordingSeconds(secs);
       });
 
-      if (started) {
-        setVoiceNotice(null);
-        setTestMouthOpen(false);
-        isRecordingRef.current = true;
-        setIsRecording(true);
-        // Automatically start speech for video broadcast
-        handlePlaySpeech();
-      } else {
+      if (!started) {
         setVoiceNotice('Impossibile avviare la registrazione video su questo browser.');
+        return;
       }
+
+      setTestMouthOpen(false);
+      isRecordingRef.current = true;
+      setIsRecording(true);
+      setIsPlayingSpeech(true);
+
+      await globalAudioEngine.playAudioBuffers(
+        buffers,
+        handleAudioMetrics,
+        () => {
+          if (speechSessionRef.current !== sessionId) return;
+          setIsPlayingSpeech(false);
+          if (isRecordingRef.current || globalVideoRecorder.getIsRecording()) {
+            void finishRecordingWithCredits();
+          }
+        }
+      );
+    } finally {
+      isPreparingRecordingRef.current = false;
+      setIsPreparingRecording(false);
     }
   };
 
@@ -452,6 +583,7 @@ export default function App() {
         recordingSeconds={recordingSeconds}
         onToggleRecord={handleToggleRecord}
         isFinalizing={isFinalizingCredits}
+        isPreparingRecording={isPreparingRecording}
       />
 
       {/* Main Studio Workspace */}
@@ -521,10 +653,12 @@ export default function App() {
 
               <button
                 onClick={handleToggleRecord}
-                disabled={isFinalizingCredits}
-                className={`px-3.5 py-1.5 font-bold rounded-lg transition-colors flex items-center gap-1.5 shadow-sm ${
+                disabled={isFinalizingCredits || isPreparingRecording}
+                className={`px-3.5 py-1.5 font-bold rounded-lg transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-70 ${
                   isFinalizingCredits
                     ? 'bg-amber-600 text-white animate-pulse'
+                    : isPreparingRecording
+                    ? 'bg-sky-700 text-white animate-pulse'
                     : isRecording
                     ? 'bg-rose-600 text-white animate-pulse'
                     : 'bg-sky-600 hover:bg-sky-500 text-white'
@@ -534,6 +668,8 @@ export default function App() {
                 <span>
                   {isFinalizingCredits
                     ? 'Titoli di Coda in Corso...'
+                    : isPreparingRecording
+                    ? 'Preparazione Audio...'
                     : isRecording
                     ? 'Termina Registrazione'
                     : 'Registra Notiziario'}

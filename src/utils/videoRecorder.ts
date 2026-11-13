@@ -4,6 +4,7 @@ export interface RecordingResult {
   durationSec: number;
   format: string;
   sizeBytes: number;
+  hasAudio: boolean;
 }
 
 export class VideoRecorderManager {
@@ -13,60 +14,79 @@ export class VideoRecorderManager {
   private startTime = 0;
   private timerInterval: number | null = null;
   private isRecording = false;
+  private hasAudioTrack = false;
 
   private createRecorderWithFallbacks(
     canvasStream: MediaStream,
     audioStream: MediaStream | null
-  ): MediaRecorder {
+  ): { recorder: MediaRecorder; hasAudio: boolean } {
     const combinedStream = new MediaStream();
     canvasStream.getVideoTracks().forEach((track) => {
       combinedStream.addTrack(track);
     });
+
+    let addedAudio = false;
     if (audioStream) {
       audioStream.getAudioTracks().forEach((track) => {
         if (track.readyState === 'live') {
           combinedStream.addTrack(track);
+          addedAudio = true;
         }
       });
     }
 
-    const candidateMimeTypes = [
-      'video/webm;codecs=vp8,opus',
-      'video/webm;codecs=vp9,opus',
-      'video/webm;codecs=vp8',
-      'video/webm;codecs=vp9',
-      'video/webm',
-      'video/mp4',
-    ];
+    const candidateMimeTypes = addedAudio
+      ? [
+          'video/webm;codecs=vp8,opus',
+          'video/webm;codecs=vp9,opus',
+          'video/mp4;codecs=avc1,mp4a.40.2',
+          'video/webm',
+          'video/mp4',
+        ]
+      : [
+          'video/webm;codecs=vp8',
+          'video/webm;codecs=vp9',
+          'video/webm',
+          'video/mp4',
+        ];
 
     const supportedMime =
       typeof MediaRecorder.isTypeSupported === 'function'
         ? candidateMimeTypes.find((m) => MediaRecorder.isTypeSupported(m))
         : undefined;
 
-    // 1. Try preferred codec + 5 Mbps bitrate on combined stream (crisp 1080p without CPU bottleneck)
     if (supportedMime) {
       try {
-        return new MediaRecorder(combinedStream, {
-          mimeType: supportedMime,
-          videoBitsPerSecond: 5_000_000,
-        });
+        return {
+          recorder: new MediaRecorder(combinedStream, {
+            mimeType: supportedMime,
+            videoBitsPerSecond: 3_500_000,
+            ...(addedAudio ? { audioBitsPerSecond: 128_000 } : {}),
+          }),
+          hasAudio: addedAudio,
+        };
       } catch {
-        // Try without bitrate hint
         try {
-          return new MediaRecorder(combinedStream, { mimeType: supportedMime });
+          return {
+            recorder: new MediaRecorder(combinedStream, { mimeType: supportedMime }),
+            hasAudio: addedAudio,
+          };
         } catch {
           // Continue to fallbacks
         }
       }
     }
 
-    // 2. Try browser default MediaRecorder on combined stream
     try {
-      return new MediaRecorder(combinedStream);
+      return {
+        recorder: new MediaRecorder(combinedStream),
+        hasAudio: addedAudio,
+      };
     } catch {
-      // 3. Last resort: video-only canvasStream (never drop recording if audio muxing fails)
-      return new MediaRecorder(canvasStream);
+      return {
+        recorder: new MediaRecorder(canvasStream),
+        hasAudio: false,
+      };
     }
   }
 
@@ -82,8 +102,9 @@ export class VideoRecorderManager {
       const canvasStream = canvas.captureStream(30);
       this.canvasStream = canvasStream;
 
-      const recorder = this.createRecorderWithFallbacks(canvasStream, audioStream);
+      const { recorder, hasAudio } = this.createRecorderWithFallbacks(canvasStream, audioStream);
       this.mediaRecorder = recorder;
+      this.hasAudioTrack = hasAudio;
 
       recorder.ondataavailable = (event) => {
         if (event.data && event.data.size > 0) {
@@ -105,13 +126,14 @@ export class VideoRecorderManager {
         }, 200);
       }
 
-      recorder.start(500);
+      recorder.start(250);
       return true;
     } catch (err) {
       console.error('Impossibile avviare la registrazione video:', err);
       this.cleanupCanvasStream();
       this.isRecording = false;
       this.mediaRecorder = null;
+      this.hasAudioTrack = false;
       return false;
     }
   }
@@ -144,12 +166,15 @@ export class VideoRecorderManager {
 
       const durationSec = Math.max(1, (performance.now() - this.startTime) / 1000);
       const mime = recorder.mimeType || 'video/webm';
+      const hadAudio = this.hasAudioTrack;
 
       const finalizeResult = () => {
         const finalBlob = new Blob(this.recordedChunks, { type: mime });
+        this.recordedChunks = [];
         this.cleanupCanvasStream();
         this.isRecording = false;
         this.mediaRecorder = null;
+        this.hasAudioTrack = false;
 
         if (finalBlob.size === 0) {
           return reject(new Error('Il video registrato risulta vuoto (0 byte).'));
@@ -162,6 +187,7 @@ export class VideoRecorderManager {
           durationSec: Math.round(durationSec * 10) / 10,
           format: mime.includes('mp4') ? 'mp4' : 'webm',
           sizeBytes: finalBlob.size,
+          hasAudio: hadAudio,
         });
       };
 
@@ -200,9 +226,11 @@ export class VideoRecorderManager {
         if (!settled) {
           settled = true;
           window.clearTimeout(safetyTimer);
+          this.recordedChunks = [];
           this.cleanupCanvasStream();
           this.isRecording = false;
           this.mediaRecorder = null;
+          this.hasAudioTrack = false;
           reject(stopErr);
         }
       }

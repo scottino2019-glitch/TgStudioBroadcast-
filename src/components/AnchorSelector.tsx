@@ -57,7 +57,6 @@ export const AnchorSelector: React.FC<AnchorSelectorProps> = ({
         avatarStyle: 'marco',
         customImageUrl: optimizedUrl,
         mouthPosition: customAnchor?.mouthPosition || { x: 0, y: -25, scale: 1.1 },
-        defaultVoice: state.selectedVoice,
         accentColor: '#38bdf8',
       };
 

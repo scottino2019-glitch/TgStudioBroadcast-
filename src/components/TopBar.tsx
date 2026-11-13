@@ -10,6 +10,7 @@ interface TopBarProps {
   recordingSeconds: number;
   onToggleRecord: () => void;
   isFinalizing?: boolean;
+  isPreparingRecording?: boolean;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -19,6 +20,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   recordingSeconds,
   onToggleRecord,
   isFinalizing,
+  isPreparingRecording,
 }) => {
   const mins = Math.floor(recordingSeconds / 60);
   const secs = Math.floor(recordingSeconds % 60);
@@ -83,6 +85,11 @@ export const TopBar: React.FC<TopBarProps> = ({
           <div className="px-4 py-2 text-xs font-bold text-amber-300 bg-amber-950/80 border border-amber-500/60 rounded-lg flex items-center gap-2 animate-pulse whitespace-nowrap">
             <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
             <span>Registrazione Titoli di Coda...</span>
+          </div>
+        ) : isPreparingRecording ? (
+          <div className="px-4 py-2 text-xs font-bold text-sky-300 bg-sky-950/80 border border-sky-500/60 rounded-lg flex items-center gap-2 animate-pulse whitespace-nowrap">
+            <Radio className="w-3.5 h-3.5 animate-spin" />
+            <span>Preparazione Audio HD...</span>
           </div>
         ) : isRecording ? (
           <button

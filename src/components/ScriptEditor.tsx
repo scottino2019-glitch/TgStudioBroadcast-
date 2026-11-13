@@ -87,14 +87,18 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
       globalAudioEngine.unlockAudio();
       setIsTestingVoice(true);
       try {
+        const controller = new AbortController();
+        const timer = window.setTimeout(() => controller.abort(), 12000);
         const res = await fetch('/api/free-tts', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
           body: JSON.stringify({
             text: sampleLine.slice(0, 140),
             lang: currentLanguage.webSpeechLang,
           }),
         });
+        window.clearTimeout(timer);
         if (res.ok) {
           const data = await res.json();
           if (data.chunks?.length) {
@@ -282,7 +286,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
               </option>
               {voices.map((v) => (
                 <option key={v.key} value={v.key}>
-                  {v.name} ({v.lang})
+                  {v.name} ({v.lang}) · Solo Ascolto
                 </option>
               ))}
             </select>

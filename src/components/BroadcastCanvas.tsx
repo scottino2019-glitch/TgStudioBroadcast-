@@ -283,7 +283,10 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = React.memo(({
             presetBgImageRef.current.complete &&
             presetBgImageRef.current.naturalWidth > 0
         );
-        const desiredBgKey = `${curBg.id}|${curBg.chromaColor || ''}|${curState.customBgUrl ? curState.customBgUrl.length : 0}|${customReady ? 1 : 0}|${presetReady ? 1 : 0}`;
+        const bgSig = curState.customBgUrl
+          ? `${curState.customBgUrl.length}:${curState.customBgUrl.slice(0, 32)}:${curState.customBgUrl.slice(-24)}`
+          : '0';
+        const desiredBgKey = `${curBg.id}|${curBg.chromaColor || ''}|${bgSig}|${customReady ? 1 : 0}|${presetReady ? 1 : 0}`;
 
         if (!bgCacheCanvasRef.current) {
           const off = document.createElement('canvas');
@@ -401,9 +404,17 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = React.memo(({
   }, []);
 
   const handleCaptureSnapshot = useCallback(() => {
-    if (canvasRef.current && onSnapshot) {
-      const dataUrl = canvasRef.current.toDataURL('image/png');
-      onSnapshot(dataUrl);
+    const canvas = canvasRef.current;
+    if (!canvas || !onSnapshot) return;
+    if (typeof canvas.toBlob === 'function') {
+      canvas.toBlob((blob) => {
+        if (!blob) return;
+        const url = URL.createObjectURL(blob);
+        onSnapshot(url);
+        window.setTimeout(() => URL.revokeObjectURL(url), 5000);
+      }, 'image/png');
+    } else {
+      onSnapshot(canvas.toDataURL('image/png'));
     }
   }, [onSnapshot]);
 

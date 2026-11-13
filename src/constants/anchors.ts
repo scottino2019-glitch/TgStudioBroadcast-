@@ -9,7 +9,6 @@ export const ANCHOR_PROFILES: AnchorProfile[] = [
     tone: 'Autorevole, chiaro, ritmo televisivo incalzante',
     avatarType: 'preset',
     avatarStyle: 'marco',
-    defaultVoice: 'Fenrir',
     accentColor: '#2563eb',
   },
   {
@@ -20,7 +19,6 @@ export const ANCHOR_PROFILES: AnchorProfile[] = [
     tone: 'Precisa, pacata, dizione internazionale impeccabile',
     avatarType: 'preset',
     avatarStyle: 'elena',
-    defaultVoice: 'Kore',
     accentColor: '#db2777',
   },
   {
@@ -31,7 +29,6 @@ export const ANCHOR_PROFILES: AnchorProfile[] = [
     tone: 'Dinamico, analitico, focalizzato su mercati e innovazione',
     avatarType: 'preset',
     avatarStyle: 'kenji',
-    defaultVoice: 'Puck',
     accentColor: '#0d9488',
   },
   {
@@ -42,7 +39,6 @@ export const ANCHOR_PROFILES: AnchorProfile[] = [
     tone: 'Energica, decisa, ideale per edizioni straordinarie',
     avatarType: 'preset',
     avatarStyle: 'svetlana',
-    defaultVoice: 'Zephyr',
     accentColor: '#ea580c',
   },
   {
@@ -53,7 +49,6 @@ export const ANCHOR_PROFILES: AnchorProfile[] = [
     tone: 'Calda, coinvolgente, profonda presenza scenica',
     avatarType: 'preset',
     avatarStyle: 'amira',
-    defaultVoice: 'Kore',
     accentColor: '#7c3aed',
   },
 ];
