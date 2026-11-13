@@ -6,6 +6,7 @@ import {
   getAllSystemVoices,
   resolveSystemVoice,
 } from '../utils/speechVoices';
+import { globalAudioEngine } from '../utils/audioAnalyzer';
 import {
   Globe,
   Mic,
@@ -76,30 +77,70 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
     };
   }, []);
 
-  const handleTestVoice = () => {
-    if (typeof window === 'undefined' || !window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
-
+  const handleTestVoice = async () => {
     const sampleLine =
       state.scriptText.trim().split(/[.!?]/)[0]?.trim() ||
       currentLanguage.sampleScript.split(/[.!?]/)[0]?.trim() ||
       'Buonasera e benvenuti al telegiornale.';
 
-    const utterance = new SpeechSynthesisUtterance(sampleLine.slice(0, 140));
-    const chosen = resolveSystemVoice(state.selectedVoiceURI, currentLanguage.webSpeechLang);
-
-    if (chosen) {
-      utterance.voice = chosen;
-      utterance.lang = chosen.lang;
-    } else {
-      utterance.lang = currentLanguage.webSpeechLang;
+    if (!state.selectedVoiceURI) {
+      globalAudioEngine.unlockAudio();
+      setIsTestingVoice(true);
+      try {
+        const res = await fetch('/api/free-tts', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: sampleLine.slice(0, 140),
+            lang: currentLanguage.webSpeechLang,
+          }),
+        });
+        if (res.ok) {
+          const data = await res.json();
+          if (data.chunks?.length) {
+            await globalAudioEngine.playAudioChunksBase64(
+              data.chunks,
+              () => {},
+              () => setIsTestingVoice(false)
+            );
+            return;
+          }
+        }
+      } catch {
+        // Fallback below
+      }
+      setIsTestingVoice(false);
     }
 
-    setIsTestingVoice(true);
-    utterance.onend = () => setIsTestingVoice(false);
-    utterance.onerror = () => setIsTestingVoice(false);
-    window.speechSynthesis.speak(utterance);
+    if (typeof window === 'undefined' || !window.speechSynthesis) return;
+    const wasSpeaking = window.speechSynthesis.speaking || window.speechSynthesis.pending;
+    window.speechSynthesis.cancel();
+
+    const startTest = () => {
+      const utterance = new SpeechSynthesisUtterance(sampleLine.slice(0, 140));
+      const chosen = resolveSystemVoice(state.selectedVoiceURI, currentLanguage.webSpeechLang);
+
+      if (chosen) {
+        utterance.voice = chosen;
+        utterance.lang = chosen.lang || currentLanguage.webSpeechLang;
+      } else {
+        utterance.lang = currentLanguage.webSpeechLang;
+      }
+
+      setIsTestingVoice(true);
+      utterance.onend = () => setIsTestingVoice(false);
+      utterance.onerror = () => setIsTestingVoice(false);
+      window.speechSynthesis.speak(utterance);
+    };
+
+    if (wasSpeaking) {
+      window.setTimeout(startTest, 80);
+    } else {
+      startTest();
+    }
   };
+
+  const autoMatchedVoice = resolveSystemVoice('', currentLanguage.webSpeechLang);
 
   // Approximate reading duration
   const wordCount = state.scriptText.trim().split(/\s+/).filter(Boolean).length;
@@ -237,7 +278,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
               className="flex-1 bg-slate-950 border border-slate-700/80 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-sky-500"
             >
               <option value="">
-                Predefinita per {currentLanguage.name} ({currentLanguage.webSpeechLang})
+                Google Studio Audio ({currentLanguage.name} · Registrabile nei Video HD)
               </option>
               {voices.map((v) => (
                 <option key={v.key} value={v.key}>
@@ -262,7 +303,7 @@ export const ScriptEditor: React.FC<ScriptEditorProps> = ({
           </div>
 
           <p className="text-[11px] text-slate-400 leading-relaxed">
-            L&apos;elenco mostra <strong className="text-slate-200">tutte le {voices.length} voci</strong> restituite direttamente dal browser (<code className="text-slate-300">speechSynthesis</code>), senza alcun filtro o modifica. Sui browser web, Chrome espone solo le proprie voci Google integrate e <strong className="text-slate-200">non consente ai siti web di leggere le voci interne di Android</strong> (su PC con Microsoft Edge vengono invece elencate anche le voci naturali maschili/femminili di sistema).
+            La voce predefinita <strong className="text-emerald-300">Google Studio Audio</strong> usa la pronuncia nativa {currentLanguage.name} senza chiavi API e viene <strong className="text-slate-200">registrata direttamente dentro i video HD</strong>. Sotto sono elencate senza filtri tutte le <strong className="text-slate-200">{voices.length} voci</strong> del browser/dispositivo{autoMatchedVoice ? ` (voce dispositivo rilevata per ${currentLanguage.name}: ${autoMatchedVoice.name})` : ''}.
           </p>
         </div>
       </div>

@@ -100,11 +100,22 @@ export async function optimizeUploadedImage(
     return readFileAsDataUrl(file, 4000);
   }
 
-  // 1. FAST PATH: Use background-threaded createImageBitmap (no main-thread lag)
+  // 1. FAST PATH: Use background-threaded createImageBitmap with browser resize when available
   if (typeof window !== 'undefined' && 'createImageBitmap' in window) {
     let bitmap: ImageBitmap | null = null;
     try {
-      bitmap = await createImageBitmap(file);
+      try {
+        bitmap = await (createImageBitmap as any)(file, {
+          resizeWidth: maxWidth,
+          resizeHeight: maxHeight,
+          resizeQuality: 'medium',
+        });
+      } catch {
+        bitmap = await createImageBitmap(file);
+      }
+      if (!bitmap) {
+        bitmap = await createImageBitmap(file);
+      }
       const nw = bitmap.width;
       const nh = bitmap.height;
 

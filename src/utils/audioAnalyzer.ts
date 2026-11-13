@@ -31,16 +31,142 @@ export class AudioLipSyncEngine {
     return this.audioCtx;
   }
 
+  private keepAliveStarted = false;
+  private playbackSessionId = 0;
+
+  public unlockAudio(): void {
+    try {
+      this.getAudioStream();
+    } catch {
+      // Ignore if AudioContext unavailable
+    }
+  }
+
   public getAudioStream(): MediaStream | null {
     try {
+      const ctx = this.initContext();
       if (!this.mediaStreamDest) {
-        const ctx = this.initContext();
         this.mediaStreamDest = ctx.createMediaStreamDestination();
+      }
+      if (!this.keepAliveStarted) {
+        // Pump silent 0-gain samples into mediaStreamDest ONLY (never speakers)
+        // so Chromium/Android MediaRecorder never stalls waiting for Opus audio frames.
+        const osc = ctx.createOscillator();
+        const silentGain = ctx.createGain();
+        silentGain.gain.value = 0;
+        osc.connect(silentGain);
+        silentGain.connect(this.mediaStreamDest);
+        osc.start();
+        this.keepAliveStarted = true;
       }
       return this.mediaStreamDest.stream;
     } catch (err) {
       console.warn('MediaStream audio non disponibile:', err);
       return null;
+    }
+  }
+
+  private decodeBase64ToArrayBuffer(base64Data: string): ArrayBuffer {
+    const binaryString = window.atob(base64Data);
+    const len = binaryString.length;
+    const bytes = new Uint8Array(len);
+    for (let i = 0; i < len; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    return bytes.buffer;
+  }
+
+  public async playAudioChunksBase64(
+    base64Chunks: string[],
+    onFrame: (metrics: VisemeMetrics) => void,
+    onEnded?: () => void
+  ): Promise<void> {
+    this.stop();
+    if (!base64Chunks || base64Chunks.length === 0) {
+      onEnded?.();
+      return;
+    }
+
+    const sessionId = ++this.playbackSessionId;
+    const ctx = this.initContext();
+    if (ctx.state === 'suspended') {
+      try {
+        await ctx.resume();
+      } catch {
+        // Continue
+      }
+    }
+    if (sessionId !== this.playbackSessionId) return;
+
+    this.onMetricsUpdate = onFrame;
+    this.onEndedCallback = onEnded || null;
+
+    if (!this.mediaStreamDest) {
+      this.mediaStreamDest = ctx.createMediaStreamDestination();
+    }
+
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.6;
+    analyser.connect(ctx.destination);
+    analyser.connect(this.mediaStreamDest);
+
+    this.analyser = analyser;
+    this.isPlaying = true;
+    this.startAnalysisLoop();
+
+    // Decode first chunk immediately; decode remaining chunks seamlessly ahead of playback
+    let nextBufferPromise: Promise<AudioBuffer> | null = ctx.decodeAudioData(
+      this.decodeBase64ToArrayBuffer(base64Chunks[0])
+    );
+
+    const playIndex = async (idx: number) => {
+      if (sessionId !== this.playbackSessionId) return;
+
+      if (idx >= base64Chunks.length || !nextBufferPromise) {
+        this.stop();
+        onEnded?.();
+        return;
+      }
+
+      const audioBuffer = await nextBufferPromise;
+      if (sessionId !== this.playbackSessionId) return;
+
+      // Pre-decode next chunk while current chunk plays
+      if (idx + 1 < base64Chunks.length) {
+        nextBufferPromise = ctx.decodeAudioData(
+          this.decodeBase64ToArrayBuffer(base64Chunks[idx + 1])
+        );
+      } else {
+        nextBufferPromise = null;
+      }
+
+      const source = ctx.createBufferSource();
+      source.buffer = audioBuffer;
+      source.connect(analyser);
+      this.currentSource = source;
+
+      source.onended = () => {
+        if (sessionId !== this.playbackSessionId) return;
+        this.currentSource = null;
+        if (idx + 1 < base64Chunks.length) {
+          void playIndex(idx + 1);
+        } else {
+          this.stop();
+          onEnded?.();
+        }
+      };
+
+      source.start(0);
+    };
+
+    try {
+      await playIndex(0);
+    } catch (err) {
+      if (sessionId === this.playbackSessionId) {
+        this.stop();
+      }
+      throw err;
     }
   }
 
@@ -254,6 +380,7 @@ export class AudioLipSyncEngine {
   }
 
   public stop() {
+    this.playbackSessionId += 1;
     this.isPlaying = false;
     if (this.animationId) {
       cancelAnimationFrame(this.animationId);

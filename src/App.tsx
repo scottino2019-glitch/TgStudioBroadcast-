@@ -135,14 +135,23 @@ export default function App() {
     LANGUAGES.find((l) => l.code === state.selectedLanguage) || LANGUAGES[0];
 
   const lastMetricUpdateRef = useRef(0);
+  const wasSpeakingMetricRef = useRef(false);
   const handleAudioMetrics = useCallback((metrics: VisemeMetrics) => {
     const now = performance.now();
-    // Throttle React state re-renders to 12fps (80ms) for UI meters without stalling the main thread.
-    // The canvas renders at 60fps pulling directly from globalAudioEngine.
-    if (now - lastMetricUpdateRef.current > 80 || !metrics.isSpeaking) {
+    // Throttle React state re-renders to ~8fps (120ms) for UI meters without stalling the main thread.
+    // The canvas pulls viseme metrics directly from globalAudioEngine.
+    if (!metrics.isSpeaking && !wasSpeakingMetricRef.current) {
+      return;
+    }
+    if (now - lastMetricUpdateRef.current > 120 || !metrics.isSpeaking) {
       lastMetricUpdateRef.current = now;
+      wasSpeakingMetricRef.current = metrics.isSpeaking;
       setVisemeMetrics(metrics);
     }
+  }, []);
+
+  const handleCanvasRef = useCallback((c: HTMLCanvasElement | null) => {
+    canvasElementRef.current = c;
   }, []);
 
   const updateState = useCallback((patch: Partial<BroadcastState>) => {
@@ -206,7 +215,7 @@ export default function App() {
     if (currentCredits.enabled) {
       // Roll full-screen broadcast End Credits slate on canvas while video recorder is capturing
       setState((prev) => ({ ...prev, showCreditsNow: true }));
-      const waitMs = Math.max(3000, (currentCredits.durationSec || 4.5) * 1000);
+      const waitMs = Math.max(2500, (currentCredits.durationSec || 4.5) * 1000);
       await new Promise((r) => setTimeout(r, waitMs));
       setState((prev) => ({ ...prev, showCreditsNow: false }));
     }
@@ -217,23 +226,78 @@ export default function App() {
       isRecordingRef.current = false;
       setRecordingSeconds(0);
       setRecordingResult(result);
-    } catch (err) {
+    } catch (err: any) {
       console.error('Errore finalizzazione video:', err);
+      setVoiceNotice(err?.message || 'Errore durante il salvataggio del video registrato.');
       setIsRecording(false);
       isRecordingRef.current = false;
+      setRecordingSeconds(0);
     } finally {
       setIsFinalizingCredits(false);
       isFinalizingRef.current = false;
     }
   }, []);
 
-  // Play Speech directly with Zero-Config Google & Android Web Speech voices
+  // Play Speech: uses recordable native Google Studio Audio by default (or chosen browser voice when selected)
   const handlePlaySpeech = async () => {
-    if (!state.scriptText.trim()) return;
+    const text = stateRef.current.scriptText.trim();
+    if (!text) return;
+
     setVoiceNotice(null);
-    setIsLoadingVoice(true);
-    try {
+    globalAudioEngine.unlockAudio();
+
+    // If user explicitly selected a browser/device Web Speech voice, play it directly without modifications
+    if (stateRef.current.selectedVoiceURI) {
       playWebSpeech();
+      return;
+    }
+
+    const sessionId = ++speechSessionRef.current;
+    setIsLoadingVoice(true);
+
+    try {
+      const res = await fetch('/api/free-tts', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          text,
+          lang: currentLanguage.webSpeechLang,
+        }),
+      });
+
+      if (speechSessionRef.current !== sessionId) return;
+
+      if (!res.ok) {
+        throw new Error(`HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      if (!data.chunks || !Array.isArray(data.chunks) || data.chunks.length === 0) {
+        throw new Error('Audio non ricevuto');
+      }
+
+      if (speechSessionRef.current !== sessionId) return;
+
+      setIsPlayingSpeech(true);
+      setIsLoadingVoice(false);
+
+      await globalAudioEngine.playAudioChunksBase64(
+        data.chunks,
+        handleAudioMetrics,
+        () => {
+          if (speechSessionRef.current !== sessionId) return;
+          setIsPlayingSpeech(false);
+          if (isRecordingRef.current || globalVideoRecorder.getIsRecording()) {
+            void finishRecordingWithCredits();
+          }
+        }
+      );
+    } catch (err) {
+      console.warn('Fallback a Web Speech locale:', err);
+      if (speechSessionRef.current === sessionId) {
+        setIsLoadingVoice(false);
+        playWebSpeech();
+      }
     } finally {
       setIsLoadingVoice(false);
     }
@@ -248,15 +312,14 @@ export default function App() {
 
     const sessionId = ++speechSessionRef.current;
     clearSpeechKeepAlive();
-    window.speechSynthesis.cancel();
+
+    const wasBusy = window.speechSynthesis.speaking || window.speechSynthesis.pending;
+    if (wasBusy) {
+      window.speechSynthesis.cancel();
+    }
 
     const chunks = splitTextIntoSpeechChunks(state.scriptText);
     if (chunks.length === 0) return;
-
-    const chosenVoice = resolveSystemVoice(
-      state.selectedVoiceURI,
-      currentLanguage.webSpeechLang
-    );
 
     // Generous max duration for lip-sync simulation; stopped explicitly when final chunk ends
     const words = state.scriptText.trim().split(/\s+/).length;
@@ -267,17 +330,6 @@ export default function App() {
       estSec,
       handleAudioMetrics
     );
-
-    // Prevent Chromium desktop/Android from pausing synthesis mid-broadcast
-    speechKeepAliveRef.current = window.setInterval(() => {
-      if (speechSessionRef.current !== sessionId) {
-        clearSpeechKeepAlive();
-        return;
-      }
-      if (window.speechSynthesis.speaking && !window.speechSynthesis.paused) {
-        window.speechSynthesis.resume();
-      }
-    }, 8000);
 
     let chunkIndex = 0;
 
@@ -298,11 +350,18 @@ export default function App() {
         return;
       }
 
+      // Resolve fresh on first/each chunk in case voices loaded asynchronously
+      const chosenVoice = resolveSystemVoice(
+        stateRef.current.selectedVoiceURI,
+        currentLanguage.webSpeechLang
+      );
+
       const utterance = new SpeechSynthesisUtterance(chunks[chunkIndex]);
       if (chosenVoice) {
         utterance.voice = chosenVoice;
         utterance.lang = chosenVoice.lang || currentLanguage.webSpeechLang;
       } else {
+        // Let the OS / Android TTS engine pick the native voice for target language (e.g. it-IT)
         utterance.lang = currentLanguage.webSpeechLang;
       }
 
@@ -324,16 +383,23 @@ export default function App() {
         if (chunkIndex < chunks.length) {
           speakNextChunk();
         } else {
-          clearSpeechKeepAlive();
-          setIsPlayingSpeech(false);
-          globalAudioEngine.stop();
+          void finishAllChunks();
         }
       };
 
       window.speechSynthesis.speak(utterance);
     };
 
-    speakNextChunk();
+    // Avoid Chromium race where synchronous cancel() cancels a newly queued utterance
+    if (wasBusy) {
+      window.setTimeout(() => {
+        if (speechSessionRef.current === sessionId) {
+          speakNextChunk();
+        }
+      }, 80);
+    } else {
+      speakNextChunk();
+    }
   };
 
   // Toggle Video Recording
@@ -428,9 +494,7 @@ export default function App() {
             isRecording={isRecording}
             recordingSeconds={recordingSeconds}
             onSnapshot={handleSnapshot}
-            canvasRefCallback={(c) => {
-              canvasElementRef.current = c;
-            }}
+            canvasRefCallback={handleCanvasRef}
           />
 
           {/* Quick Studio Bar below Viewport */}

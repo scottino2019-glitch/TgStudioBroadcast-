@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState, useCallback } from 'react';
+import React, { useEffect, useRef, useCallback } from 'react';
 import {
   BroadcastState,
   AnchorProfile,
@@ -24,42 +24,43 @@ interface BroadcastCanvasProps {
   canvasRefCallback?: (canvas: HTMLCanvasElement | null) => void;
 }
 
-// In-memory image cache to eliminate re-decoding lag
+// Bounded in-memory image cache (max 10 entries) to eliminate re-decoding lag & prevent memory bloat
+const MAX_IMAGE_CACHE = 10;
 const imageCache = new Map<string, HTMLImageElement>();
 
-// Deterministic synchronous/asynchronous image loader with persistent caching
+function setBoundedCache(url: string, img: HTMLImageElement) {
+  if (!imageCache.has(url) && imageCache.size >= MAX_IMAGE_CACHE) {
+    const oldestKey = imageCache.keys().next().value;
+    if (oldestKey) imageCache.delete(oldestKey);
+  }
+  imageCache.set(url, img);
+}
+
+// Deterministic synchronous/asynchronous image loader with persistent bounded caching
 function getOrLoadImage(url: string | null | undefined): HTMLImageElement | null {
   if (!url) return null;
-  let cached = imageCache.get(url);
+  const cached = imageCache.get(url);
   if (cached) {
     return cached;
   }
 
   const img = new Image();
-  // NEVER set crossOrigin on data: or blob: URIs
   if (url.startsWith('http://') || url.startsWith('https://')) {
     img.crossOrigin = 'anonymous';
   }
 
   img.onload = () => {
-    imageCache.set(url, img);
+    setBoundedCache(url, img);
   };
   img.onerror = () => {
     console.warn('Errore caricamento immagine:', url.slice(0, 50));
   };
   img.src = url;
-  imageCache.set(url, img);
-
-  if (typeof img.decode === 'function') {
-    img.decode().then(() => {
-      imageCache.set(url, img);
-    }).catch(() => {});
-  }
+  setBoundedCache(url, img);
 
   return img;
 }
 
-// Safe image loader that never sets crossOrigin on data: or blob: URIs and uses decode()
 function loadSafeImage(
   url: string | null | undefined,
   onLoaded: (img: HTMLImageElement) => void,
@@ -70,7 +71,6 @@ function loadSafeImage(
     return;
   }
 
-  // Check cache first for instant synchronous availability
   const cached = imageCache.get(url);
   if (cached && cached.complete && cached.naturalWidth > 0) {
     onLoaded(cached);
@@ -92,7 +92,11 @@ function loadSafeImage(
   img.addEventListener('error', () => onError?.(), { once: true });
 }
 
-export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
+// Ticker text measurement cache to avoid calling ctx.measureText every frame
+let cachedTickerMeasureKey = '';
+let cachedTickerUnitWidth = 400;
+
+export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = React.memo(({
   state,
   currentAnchor,
   currentBg,
@@ -111,11 +115,17 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
   const pipImageRef = useRef<HTMLImageElement | null>(null);
   const customAnchorImgRef = useRef<HTMLImageElement | null>(null);
 
-  // Marquee scroll offset
+  // Offscreen cache canvases so heavy static layers (1080p background + vignette + news desk) are drawn ONCE
+  const bgCacheCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const bgCacheKeyRef = useRef<string>('');
+  const deskCacheCanvasRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Marquee scroll offset & frame pacing
   const tickerOffsetRef = useRef<number>(0);
   const lastFrameTimeRef = useRef<number>(performance.now());
+  const lastDrawTimeRef = useRef<number>(0);
 
-  // Keep latest props in a stable ref so continuous 60fps render loop never needs to restart
+  // Keep latest props in a stable ref so continuous render loop never restarts
   const latestPropsRef = useRef({
     state,
     currentAnchor,
@@ -141,39 +151,68 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
         currentBg.url,
         (img) => {
           presetBgImageRef.current = img;
+          bgCacheKeyRef.current = ''; // Force offscreen background rebuild
         },
         () => {
           presetBgImageRef.current = null;
+          bgCacheKeyRef.current = '';
         }
       );
+    } else {
+      presetBgImageRef.current = null;
+      bgCacheKeyRef.current = '';
     }
   }, [currentBg.url]);
 
   // Preload Custom Background Image (user uploaded)
   useEffect(() => {
     if (state.customBgUrl) {
-      const img = getOrLoadImage(state.customBgUrl);
-      customBgImageRef.current = img;
+      loadSafeImage(
+        state.customBgUrl,
+        (img) => {
+          customBgImageRef.current = img;
+          bgCacheKeyRef.current = '';
+        },
+        () => {
+          customBgImageRef.current = null;
+          bgCacheKeyRef.current = '';
+        }
+      );
     } else {
       customBgImageRef.current = null;
+      bgCacheKeyRef.current = '';
     }
   }, [state.customBgUrl]);
 
-  // Preload PiP Image safely with immediate reference & global cache
+  // Preload PiP Image safely
   useEffect(() => {
     if (state.pip.enabled && state.pip.imageUrl) {
-      const img = getOrLoadImage(state.pip.imageUrl);
-      pipImageRef.current = img;
+      loadSafeImage(
+        state.pip.imageUrl,
+        (img) => {
+          pipImageRef.current = img;
+        },
+        () => {
+          pipImageRef.current = null;
+        }
+      );
     } else {
       pipImageRef.current = null;
     }
   }, [state.pip.enabled, state.pip.imageUrl]);
 
-  // Preload Custom Anchor Photo safely with immediate reference & global cache
+  // Preload Custom Anchor Photo safely
   useEffect(() => {
     if (currentAnchor.avatarType === 'custom' && currentAnchor.customImageUrl) {
-      const img = getOrLoadImage(currentAnchor.customImageUrl);
-      customAnchorImgRef.current = img;
+      loadSafeImage(
+        currentAnchor.customImageUrl,
+        (img) => {
+          customAnchorImgRef.current = img;
+        },
+        () => {
+          customAnchorImgRef.current = null;
+        }
+      );
     } else {
       customAnchorImgRef.current = null;
     }
@@ -186,21 +225,29 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
     }
   }, [canvasRefCallback]);
 
-  // Main Render Loop - Continuous 60FPS loop with zero teardown lag
+  // Main Render Loop - Paced at smooth 30 FPS (matching 30 FPS video capture) to keep CPU cool and UI zero-lag
   useEffect(() => {
     let animationFrameId: number;
 
-    const render = () => {
+    const render = (now: number) => {
+      animationFrameId = requestAnimationFrame(render);
+
+      // Pause work while browser tab is hidden
+      if (typeof document !== 'undefined' && document.hidden) {
+        lastFrameTimeRef.current = now;
+        return;
+      }
+
+      // Pace to ~30 FPS (~26ms threshold -> draws every 2nd tick on 60Hz, every 4th on 120Hz)
+      if (lastDrawTimeRef.current > 0 && now - lastDrawTimeRef.current < 26) {
+        return;
+      }
+      lastDrawTimeRef.current = now;
+
       const canvas = canvasRef.current;
-      if (!canvas) {
-        animationFrameId = requestAnimationFrame(render);
-        return;
-      }
-      const ctx = canvas.getContext('2d');
-      if (!ctx) {
-        animationFrameId = requestAnimationFrame(render);
-        return;
-      }
+      if (!canvas) return;
+      const ctx = canvas.getContext('2d', { alpha: false });
+      if (!ctx) return;
 
       try {
         const {
@@ -215,8 +262,7 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
           ? globalAudioEngine.getCurrentMetrics()
           : latestPropsRef.current.visemeMetrics;
 
-        const now = performance.now();
-        const dt = Math.min(0.1, (now - lastFrameTimeRef.current) / 1000);
+        const dt = Math.min(0.1, Math.max(0.001, (now - lastFrameTimeRef.current) / 1000));
         lastFrameTimeRef.current = now;
 
         // Update animation state (blinks, gaze saccades)
@@ -225,77 +271,43 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
         const W = canvas.width;
         const H = canvas.height;
 
-        // 1. LAYER 0: BACKGROUND
-        ctx.clearRect(0, 0, W, H);
+        // 1. LAYER 0: CACHED BACKGROUND (Rebuilt only when background source changes)
+        const customReady = Boolean(
+          curState.customBgUrl &&
+            customBgImageRef.current &&
+            customBgImageRef.current.complete &&
+            customBgImageRef.current.naturalWidth > 0
+        );
+        const presetReady = Boolean(
+          presetBgImageRef.current &&
+            presetBgImageRef.current.complete &&
+            presetBgImageRef.current.naturalWidth > 0
+        );
+        const desiredBgKey = `${curBg.id}|${curBg.chromaColor || ''}|${curState.customBgUrl ? curState.customBgUrl.length : 0}|${customReady ? 1 : 0}|${presetReady ? 1 : 0}`;
 
-        let drewBg = false;
+        if (!bgCacheCanvasRef.current) {
+          const off = document.createElement('canvas');
+          off.width = W;
+          off.height = H;
+          bgCacheCanvasRef.current = off;
+        }
 
-        // Check user-uploaded custom background first
-        if (curState.customBgUrl && customBgImageRef.current) {
-          const customImg = customBgImageRef.current;
-          if (customImg.complete && customImg.naturalWidth > 0) {
-            try {
-              const nw = customImg.naturalWidth || customImg.width || 1920;
-              const nh = customImg.naturalHeight || customImg.height || 1080;
-              const scale = Math.max(W / nw, H / nh);
-              const dw = nw * scale;
-              const dh = nh * scale;
-              const dx = (W - dw) / 2;
-              const dy = (H - dh) / 2;
-              ctx.drawImage(customImg, dx, dy, dw, dh);
-
-              // Subtle broadcast vignette
-              const vignette = ctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, W * 0.7);
-              vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
-              vignette.addColorStop(1, 'rgba(0, 0, 0, 0.45)');
-              ctx.fillStyle = vignette;
-              ctx.fillRect(0, 0, W, H);
-              drewBg = true;
-            } catch (err) {
-              console.warn('Errore rendering sfondo custom:', err);
-            }
+        if (bgCacheKeyRef.current !== desiredBgKey) {
+          const bgCtx = bgCacheCanvasRef.current.getContext('2d', { alpha: false });
+          if (bgCtx) {
+            renderStaticBackground(
+              bgCtx,
+              W,
+              H,
+              curBg,
+              customReady ? customBgImageRef.current : null,
+              presetReady ? presetBgImageRef.current : null
+            );
+            bgCacheKeyRef.current = desiredBgKey;
           }
         }
 
-        // Fallback to Chroma or Preset Studio Background
-        if (!drewBg) {
-          if (curBg.category === 'chroma' && curBg.chromaColor) {
-            ctx.fillStyle = curBg.chromaColor;
-            ctx.fillRect(0, 0, W, H);
-            drewBg = true;
-          } else if (presetBgImageRef.current && presetBgImageRef.current.complete && presetBgImageRef.current.naturalWidth > 0) {
-            try {
-              const img = presetBgImageRef.current;
-              const nw = img.naturalWidth || img.width || 1920;
-              const nh = img.naturalHeight || img.height || 1080;
-              const scale = Math.max(W / nw, H / nh);
-              const dw = nw * scale;
-              const dh = nh * scale;
-              const dx = (W - dw) / 2;
-              const dy = (H - dh) / 2;
-              ctx.drawImage(img, dx, dy, dw, dh);
-
-              const vignette = ctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, W * 0.7);
-              vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
-              vignette.addColorStop(1, 'rgba(0, 0, 0, 0.45)');
-              ctx.fillStyle = vignette;
-              ctx.fillRect(0, 0, W, H);
-              drewBg = true;
-            } catch (err) {
-              console.warn('Errore rendering sfondo preset:', err);
-            }
-          }
-        }
-
-        // Absolute fallback: TV Studio dark gradient
-        if (!drewBg) {
-          const grad = ctx.createLinearGradient(0, 0, 0, H);
-          grad.addColorStop(0, '#09152e');
-          grad.addColorStop(0.5, '#020617');
-          grad.addColorStop(1, '#050c1f');
-          ctx.fillStyle = grad;
-          ctx.fillRect(0, 0, W, H);
-        }
+        ctx.drawImage(bgCacheCanvasRef.current, 0, 0);
 
         // 2. LAYER 1: AVATAR
         const zoomMult =
@@ -310,7 +322,6 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
         const baseScale = curState.avatarScale || 2.25;
         const finalScale = baseScale * zoomMult;
 
-        // Position anchor prominently in optical center with user offsets
         const offsetX = curState.avatarPositionX || 0;
         const offsetY = curState.avatarPositionY || 0;
 
@@ -331,9 +342,19 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
           customAnchorImgRef.current
         );
 
-        // 3. LAYER 2: ANCHOR DESK OVERLAY
+        // 3. LAYER 2: CACHED ANCHOR DESK OVERLAY
         if (curState.deskOverlay && curBg.category !== 'chroma') {
-          drawNewsDesk(ctx, W, H);
+          if (!deskCacheCanvasRef.current) {
+            const deskOff = document.createElement('canvas');
+            deskOff.width = W;
+            deskOff.height = H;
+            const deskCtx = deskOff.getContext('2d');
+            if (deskCtx) {
+              drawNewsDesk(deskCtx, W, H);
+            }
+            deskCacheCanvasRef.current = deskOff;
+          }
+          ctx.drawImage(deskCacheCanvasRef.current, 0, 0);
         }
 
         // 4. LAYER 3: PICTURE-IN-PICTURE (PiP) GRAPHIC
@@ -372,8 +393,6 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
         }
       } catch (renderError) {
         console.error('Frame render exception:', renderError);
-      } finally {
-        animationFrameId = requestAnimationFrame(render);
       }
     };
 
@@ -417,67 +436,82 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
           <span>APERTURA {Math.round(visemeMetrics.openness * 100)}%</span>
         </div>
       )}
-
-      {/* Off-screen Pre-Decoders for zero-delay canvas rendering */}
-      {state.pip.enabled && state.pip.imageUrl && (
-        <img
-          key={`pip-cache-${state.pip.imageUrl.length}-${state.pip.imageUrl.slice(-32)}`}
-          src={state.pip.imageUrl}
-          alt=""
-          className="hidden"
-          aria-hidden="true"
-          onLoad={(e) => {
-            const el = e.currentTarget;
-            if (el.naturalWidth > 0) {
-              imageCache.set(state.pip.imageUrl, el);
-              pipImageRef.current = el;
-            }
-          }}
-        />
-      )}
-      {state.customBgUrl && (
-        <img
-          key={`bg-cache-${state.customBgUrl.length}-${state.customBgUrl.slice(-32)}`}
-          src={state.customBgUrl}
-          alt=""
-          className="hidden"
-          aria-hidden="true"
-          onLoad={(e) => {
-            const el = e.currentTarget;
-            if (el.naturalWidth > 0) {
-              imageCache.set(state.customBgUrl!, el);
-              customBgImageRef.current = el;
-            }
-          }}
-        />
-      )}
-      {currentAnchor.avatarType === 'custom' && currentAnchor.customImageUrl && (
-        <img
-          key={`anchor-cache-${currentAnchor.customImageUrl.length}-${currentAnchor.customImageUrl.slice(-32)}`}
-          src={currentAnchor.customImageUrl}
-          alt=""
-          className="hidden"
-          aria-hidden="true"
-          onLoad={(e) => {
-            const el = e.currentTarget;
-            if (el.naturalWidth > 0) {
-              imageCache.set(currentAnchor.customImageUrl!, el);
-              customAnchorImgRef.current = el;
-            }
-          }}
-        />
-      )}
     </div>
   );
-};
+});
 
 // --- DRAWING HELPERS ---
+
+function renderStaticBackground(
+  ctx: CanvasRenderingContext2D,
+  W: number,
+  H: number,
+  curBg: StudioBackground,
+  customImg: HTMLImageElement | null,
+  presetImg: HTMLImageElement | null
+) {
+  if (customImg) {
+    try {
+      const nw = customImg.naturalWidth || 1920;
+      const nh = customImg.naturalHeight || 1080;
+      const scale = Math.max(W / nw, H / nh);
+      const dw = nw * scale;
+      const dh = nh * scale;
+      const dx = (W - dw) / 2;
+      const dy = (H - dh) / 2;
+      ctx.drawImage(customImg, dx, dy, dw, dh);
+
+      const vignette = ctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, W * 0.7);
+      vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
+      vignette.addColorStop(1, 'rgba(0, 0, 0, 0.45)');
+      ctx.fillStyle = vignette;
+      ctx.fillRect(0, 0, W, H);
+      return;
+    } catch (err) {
+      console.warn('Errore cache sfondo custom:', err);
+    }
+  }
+
+  if (curBg.category === 'chroma' && curBg.chromaColor) {
+    ctx.fillStyle = curBg.chromaColor;
+    ctx.fillRect(0, 0, W, H);
+    return;
+  }
+
+  if (presetImg) {
+    try {
+      const nw = presetImg.naturalWidth || 1920;
+      const nh = presetImg.naturalHeight || 1080;
+      const scale = Math.max(W / nw, H / nh);
+      const dw = nw * scale;
+      const dh = nh * scale;
+      const dx = (W - dw) / 2;
+      const dy = (H - dh) / 2;
+      ctx.drawImage(presetImg, dx, dy, dw, dh);
+
+      const vignette = ctx.createRadialGradient(W / 2, H / 2, H * 0.3, W / 2, H / 2, W * 0.7);
+      vignette.addColorStop(0, 'rgba(0, 0, 0, 0)');
+      vignette.addColorStop(1, 'rgba(0, 0, 0, 0.45)');
+      ctx.fillStyle = vignette;
+      ctx.fillRect(0, 0, W, H);
+      return;
+    } catch (err) {
+      console.warn('Errore cache sfondo preset:', err);
+    }
+  }
+
+  const grad = ctx.createLinearGradient(0, 0, 0, H);
+  grad.addColorStop(0, '#09152e');
+  grad.addColorStop(0.5, '#020617');
+  grad.addColorStop(1, '#050c1f');
+  ctx.fillStyle = grad;
+  ctx.fillRect(0, 0, W, H);
+}
 
 function drawNewsDesk(ctx: CanvasRenderingContext2D, W: number, H: number) {
   ctx.save();
   const deskTopY = H * 0.81;
 
-  // Glass desk curved surface
   ctx.beginPath();
   ctx.moveTo(W * 0.1, H);
   ctx.lineTo(W * 0.18, deskTopY);
@@ -485,7 +519,6 @@ function drawNewsDesk(ctx: CanvasRenderingContext2D, W: number, H: number) {
   ctx.lineTo(W * 0.9, H);
   ctx.closePath();
 
-  // Polished glass / wood gradient
   const deskGrad = ctx.createLinearGradient(0, deskTopY - 20, 0, H);
   deskGrad.addColorStop(0, 'rgba(30, 41, 59, 0.88)');
   deskGrad.addColorStop(0.15, 'rgba(15, 23, 42, 0.96)');
@@ -493,7 +526,6 @@ function drawNewsDesk(ctx: CanvasRenderingContext2D, W: number, H: number) {
   ctx.fillStyle = deskGrad;
   ctx.fill();
 
-  // Rim reflection light
   ctx.beginPath();
   ctx.moveTo(W * 0.18, deskTopY);
   ctx.bezierCurveTo(W * 0.35, deskTopY - 14, W * 0.65, deskTopY - 14, W * 0.82, deskTopY);
@@ -501,7 +533,6 @@ function drawNewsDesk(ctx: CanvasRenderingContext2D, W: number, H: number) {
   ctx.lineWidth = 3.5;
   ctx.stroke();
 
-  // Subtle studio tablet on desk
   ctx.save();
   ctx.translate(W * 0.36, deskTopY + 18);
   ctx.rotate(-0.06);
@@ -512,7 +543,6 @@ function drawNewsDesk(ctx: CanvasRenderingContext2D, W: number, H: number) {
   ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
   ctx.lineWidth = 1.5;
   ctx.stroke();
-  // Screen glow
   ctx.fillStyle = 'rgba(59, 130, 246, 0.35)';
   ctx.fillRect(-40, -24, 80, 48);
   ctx.restore();
@@ -523,7 +553,7 @@ function drawNewsDesk(ctx: CanvasRenderingContext2D, W: number, H: number) {
 function drawPipWindow(
   ctx: CanvasRenderingContext2D,
   W: number,
-  H: number,
+  _H: number,
   pip: BroadcastState['pip'],
   imgFromRef: HTMLImageElement | null
 ) {
@@ -534,10 +564,15 @@ function drawPipWindow(
   const x = pip.position === 'top-right' ? W - pipW - margin : margin;
   const y = 90;
 
-  // Window Shadow
-  ctx.shadowColor = 'rgba(0, 0, 0, 0.7)';
-  ctx.shadowBlur = 24;
-  ctx.shadowOffsetY = 12;
+  // Lightweight drop shadow (no expensive Gaussian shadowBlur)
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+  if (typeof ctx.roundRect === 'function') {
+    ctx.beginPath();
+    ctx.roundRect(x + 2, y + 8, pipW + 8, pipH + 8, 12);
+    ctx.fill();
+  } else {
+    ctx.fillRect(x + 2, y + 8, pipW + 8, pipH + 8);
+  }
 
   // Window Outer Frame
   ctx.fillStyle = '#0f172a';
@@ -549,8 +584,6 @@ function drawPipWindow(
     ctx.fillRect(x - 5, y - 5, pipW + 10, pipH + 10);
   }
 
-  ctx.shadowColor = 'transparent';
-
   // Inner Image Clip
   ctx.save();
   ctx.beginPath();
@@ -561,46 +594,34 @@ function drawPipWindow(
   }
   ctx.clip();
 
-  // Resolve target image: ref first, then imageCache, then on-demand loader
   let targetImg = imgFromRef;
-  if (!targetImg || (!targetImg.complete && targetImg.naturalWidth === 0)) {
+  if (!targetImg || !targetImg.complete || targetImg.naturalWidth === 0) {
     if (pip.imageUrl) {
       targetImg = imageCache.get(pip.imageUrl) || getOrLoadImage(pip.imageUrl);
     }
   }
 
   let drewImage = false;
-  if (targetImg) {
-    const isReady =
-      (targetImg.naturalWidth > 0 && targetImg.naturalHeight > 0) ||
-      (targetImg.complete && targetImg.width > 0 && targetImg.height > 0);
-
-    if (isReady) {
-      const nw = targetImg.naturalWidth || targetImg.width || pipW;
-      const nh = targetImg.naturalHeight || targetImg.height || pipH;
-      if (nw > 0 && nh > 0) {
-        const scale = Math.max(pipW / nw, pipH / nh);
-        const iw = nw * scale;
-        const ih = nh * scale;
-        const ix = x + (pipW - iw) / 2;
-        const iy = y + (pipH - ih) / 2;
-        try {
-          ctx.drawImage(targetImg, ix, iy, iw, ih);
-          drewImage = true;
-        } catch (pipDrawErr) {
-          console.warn('Errore drawImage PiP:', pipDrawErr);
-        }
+  if (targetImg && targetImg.complete && targetImg.naturalWidth > 0) {
+    const nw = targetImg.naturalWidth;
+    const nh = targetImg.naturalHeight;
+    if (nw > 0 && nh > 0) {
+      const scale = Math.max(pipW / nw, pipH / nh);
+      const iw = nw * scale;
+      const ih = nh * scale;
+      const ix = x + (pipW - iw) / 2;
+      const iy = y + (pipH - ih) / 2;
+      try {
+        ctx.drawImage(targetImg, ix, iy, iw, ih);
+        drewImage = true;
+      } catch (pipDrawErr) {
+        console.warn('Errore drawImage PiP:', pipDrawErr);
       }
     }
   }
 
   if (!drewImage) {
-    // Television newsroom graphic placeholder
-    const grad = ctx.createLinearGradient(x, y, x + pipW, y + pipH);
-    grad.addColorStop(0, '#0f172a');
-    grad.addColorStop(0.5, '#1e293b');
-    grad.addColorStop(1, '#090d16');
-    ctx.fillStyle = grad;
+    ctx.fillStyle = '#0f172a';
     ctx.fillRect(x, y, pipW, pipH);
 
     ctx.fillStyle = '#38bdf8';
@@ -618,7 +639,6 @@ function drawPipWindow(
     );
   }
 
-  // Subtle border highlight
   ctx.strokeStyle = 'rgba(56, 189, 248, 0.6)';
   ctx.lineWidth = 2;
   if (typeof ctx.roundRect === 'function') {
@@ -628,7 +648,7 @@ function drawPipWindow(
   } else {
     ctx.strokeRect(x, y, pipW, pipH);
   }
-  ctx.restore(); // Restores Inner Image Clip
+  ctx.restore();
 
   // PiP Topic Ribbon
   if (pip.topicTag) {
@@ -652,7 +672,7 @@ function drawPipWindow(
     ctx.restore();
   }
 
-  ctx.restore(); // Restores Window
+  ctx.restore();
 }
 
 function drawWatermark(
@@ -667,19 +687,20 @@ function drawWatermark(
   const y = 50;
 
   ctx.textAlign = isRight ? 'right' : 'left';
-
-  // Channel Brand Name
   ctx.font = '900 32px "Barlow Condensed", sans-serif';
+  const brand = watermark.text.toUpperCase();
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+  ctx.fillText(brand, x + 2, y + 2);
   ctx.fillStyle = '#ffffff';
-  ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
-  ctx.shadowBlur = 8;
-  ctx.fillText(watermark.text.toUpperCase(), x, y);
+  ctx.fillText(brand, x, y);
 
-  // Live Pill / Subtext
   if (watermark.subtext) {
     ctx.font = '700 16px "Barlow Condensed", sans-serif';
+    const sub = watermark.subtext.toUpperCase();
+    ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+    ctx.fillText(sub, x + 1, y + 27);
     ctx.fillStyle = '#ef4444';
-    ctx.fillText(watermark.subtext.toUpperCase(), x, y + 26);
+    ctx.fillText(sub, x, y + 26);
   }
 
   ctx.restore();
@@ -692,11 +713,10 @@ function drawLowerThird(
   cfg: BroadcastState['lowerThird']
 ) {
   ctx.save();
-  const baseY = H * 0.715; // Positioned cleanly above the 136px ticker with generous breathing room
+  const baseY = H * 0.715;
   const leftX = W * 0.05;
   const maxW = W * 0.90;
 
-  // 1. Category Tag (e.g. ULTIM'ORA / BREAKING NEWS)
   if (cfg.category) {
     ctx.font = '900 28px "Plus Jakarta Sans", "Barlow Condensed", sans-serif';
     const catText = cfg.category.toUpperCase();
@@ -712,27 +732,26 @@ function drawLowerThird(
     ctx.fillText(catText, leftX + 21, baseY - 27);
   }
 
-  // 2. Primary Headline Box - Prominent & Highly Legible
   const headlineHeight = 84;
+  // Lightweight drop shadow fill instead of shadowBlur
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.45)';
+  ctx.beginPath();
+  ctx.roundRect(leftX + 4, baseY + 2, maxW, headlineHeight, [0, 10, 0, 0]);
+  ctx.fill();
+
   ctx.fillStyle = 'rgba(10, 15, 29, 0.98)';
-  ctx.shadowColor = 'rgba(0, 0, 0, 0.8)';
-  ctx.shadowBlur = 20;
   ctx.beginPath();
   ctx.roundRect(leftX, baseY - 4, maxW, headlineHeight, [0, 10, 0, 0]);
   ctx.fill();
-  ctx.shadowColor = 'transparent';
 
-  // Left Color Accent Strip
   ctx.fillStyle = cfg.style === 'breaking' ? '#ef4444' : '#3b82f6';
   ctx.fillRect(leftX, baseY - 4, 12, headlineHeight);
 
-  // Headline Text - 44px bold broadcast typography
   ctx.font = '900 44px "Plus Jakarta Sans", "Barlow Condensed", sans-serif';
   ctx.fillStyle = '#ffffff';
   ctx.textBaseline = 'middle';
   ctx.fillText(cfg.headline, leftX + 32, baseY + 38, maxW - 64);
 
-  // 3. Subheadline / Location Bar
   if (cfg.subheadline) {
     const subH = 44;
     ctx.fillStyle = 'rgba(23, 32, 51, 0.96)';
@@ -744,7 +763,6 @@ function drawLowerThird(
     ctx.fillText(cfg.subheadline.toUpperCase(), leftX + 32, baseY + headlineHeight + 18, maxW * 0.74);
   }
 
-  // 4. Anchor Name & Role Bug (Right side of lower third)
   if (cfg.anchorName) {
     ctx.textAlign = 'right';
     const nameX = leftX + maxW - 28;
@@ -771,53 +789,44 @@ function drawTicker(
   offset: number
 ) {
   ctx.save();
-  const tickerH = 136; // Ultra-legible 136px broadcast ticker bar
+  const tickerH = 136;
   const y = H - tickerH;
 
-  // Background styling with ultra-crisp high-contrast TV palette
   let barBg = '#000000';
   let tagBg = '#111827';
   let tagTextColor = '#facc15';
   let textColor = '#ffffff';
   let topAccentColor = '#facc15';
-  let strokeColor = '#000000';
+  let shadowTextColor = '#000000';
 
   if (ticker.bgStyle === 'red') {
-    barBg = '#7f1d1d'; // Deep broadcast crimson
-    tagBg = '#450a0a'; // Darker wine red badge
+    barBg = '#7f1d1d';
+    tagBg = '#450a0a';
     tagTextColor = '#fef08a';
     textColor = '#ffffff';
     topAccentColor = '#fef08a';
-    strokeColor = '#000000';
+    shadowTextColor = 'rgba(0, 0, 0, 0.85)';
   } else if (ticker.bgStyle === 'yellow') {
-    barBg = '#facc15'; // High-visibility yellow
-    tagBg = '#000000'; // Pure black tag
+    barBg = '#facc15';
+    tagBg = '#000000';
     tagTextColor = '#facc15';
-    textColor = '#000000'; // Jet black text on yellow
+    textColor = '#000000';
     topAccentColor = '#000000';
-    strokeColor = 'transparent';
+    shadowTextColor = 'transparent';
   } else if (ticker.bgStyle === 'navy' || ticker.bgStyle === 'blue') {
-    barBg = '#0f172a'; // Deep Broadcast Navy
-    tagBg = '#1d4ed8'; // Cobalt tag
+    barBg = '#0f172a';
+    tagBg = '#1d4ed8';
     tagTextColor = '#ffffff';
     textColor = '#ffffff';
     topAccentColor = '#38bdf8';
-    strokeColor = '#020617';
-  } else {
-    // 'black' (Nero HD): Pure Solid Black with zero red bleed & maximum luminance contrast
-    barBg = '#000000';
-    tagBg = '#111827';
-    tagTextColor = '#facc15';
-    textColor = '#ffffff';
-    topAccentColor = '#facc15';
-    strokeColor = '#000000';
+    shadowTextColor = 'rgba(0, 0, 0, 0.85)';
   }
 
-  // 1. Full ticker background bar (100% opaque solid fill)
+  // 1. Solid opaque ticker bar
   ctx.fillStyle = barBg;
   ctx.fillRect(0, y, W, tickerH);
 
-  // 2. Top accent highlight strip
+  // 2. Top accent strip
   ctx.fillStyle = topAccentColor;
   ctx.fillRect(0, y, W, 5);
 
@@ -826,24 +835,21 @@ function drawTicker(
   ctx.fillStyle = tagBg;
   ctx.fillRect(0, y + 5, tagW, tickerH - 5);
 
-  // Station Badge Text
   ctx.font = '800 32px "Plus Jakarta Sans", Arial, sans-serif';
   ctx.fillStyle = tagTextColor;
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
   ctx.fillText((ticker.label || 'TG 24 LIVE').toUpperCase(), tagW / 2, y + tickerH / 2 + 2, tagW - 24);
 
-  // Vertical separator between stationary badge and marquee
   ctx.fillStyle = topAccentColor;
   ctx.fillRect(tagW - 4, y, 4, tickerH);
 
-  // 4. Marquee Text Area (Clipped cleanly right of the badge)
+  // 4. Clipped Marquee Text Area
   ctx.save();
   ctx.beginPath();
   ctx.rect(tagW, y, W - tagW, tickerH);
   ctx.clip();
 
-  // Sharp, large broadcast typography (weight 800 matches loaded Google Font)
   let fontPixels = 64;
   if (ticker.fontSize === 'gigantic') fontPixels = 76;
   else if (ticker.fontSize === 'huge') fontPixels = 64;
@@ -856,19 +862,22 @@ function drawTicker(
 
   const cleanTickerText = (ticker.text || '').replace(/\s+/g, ' ').trim();
   const unitText = cleanTickerText ? `${cleanTickerText}   ●   ` : 'TG STUDIO LIVE   ●   ';
-  const unitWidth = Math.max(200, ctx.measureText(unitText).width);
-  const loopOffset = -(offset % unitWidth);
+  const measureKey = `${fontPixels}|${unitText}`;
+  if (cachedTickerMeasureKey !== measureKey) {
+    cachedTickerUnitWidth = Math.max(200, ctx.measureText(unitText).width);
+    cachedTickerMeasureKey = measureKey;
+  }
 
+  const unitWidth = cachedTickerUnitWidth;
+  const loopOffset = -(offset % unitWidth);
   const textY = y + tickerH / 2 + 3;
 
-  // Draw only visible marquee segments across [tagW, W] for sharp 60fps performance
+  // Fast crisp fillText (avoids slow 60fps strokeText glyph outline tessellation)
   for (let posX = tagW + loopOffset; posX < W; posX += unitWidth) {
     if (posX + unitWidth >= tagW) {
-      if (strokeColor !== 'transparent') {
-        ctx.strokeStyle = strokeColor;
-        ctx.lineWidth = 6;
-        ctx.lineJoin = 'round';
-        ctx.strokeText(unitText, posX, textY);
+      if (shadowTextColor !== 'transparent' && barBg !== '#000000') {
+        ctx.fillStyle = shadowTextColor;
+        ctx.fillText(unitText, posX + 2, textY + 2);
       }
       ctx.fillStyle = textColor;
       ctx.fillText(unitText, posX, textY);
@@ -888,93 +897,67 @@ function drawEndCreditsSlate(
   anchor: AnchorProfile
 ) {
   ctx.save();
-  // 100% Solid opaque deep slate background so credits are crystal clear
   ctx.fillStyle = '#030712';
   ctx.fillRect(0, 0, W, H);
 
-  // Subtle studio light cones
-  const grad = ctx.createRadialGradient(W / 2, H * 0.4, 80, W / 2, H * 0.4, 900);
-  grad.addColorStop(0, 'rgba(30, 58, 138, 0.35)');
-  grad.addColorStop(0.6, 'rgba(15, 23, 42, 0.8)');
-  grad.addColorStop(1, '#030712');
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, W, H);
-
-  // Broadcast Credits Card
   const cardW = 1280;
   const cardH = 840;
   const cardX = (W - cardW) / 2;
   const cardY = (H - cardH) / 2;
 
-  // Outer glow & card background
-  ctx.shadowColor = 'rgba(56, 189, 248, 0.35)';
-  ctx.shadowBlur = 50;
   ctx.fillStyle = '#090d1a';
   ctx.beginPath();
   ctx.roundRect(cardX, cardY, cardW, cardH, 20);
   ctx.fill();
-  ctx.shadowColor = 'transparent';
 
-  // Metallic border
   ctx.strokeStyle = 'rgba(148, 163, 184, 0.5)';
   ctx.lineWidth = 3.5;
   ctx.stroke();
 
-  // Top Red Accent Banner
   ctx.fillStyle = '#dc2626';
   ctx.beginPath();
   ctx.roundRect(cardX, cardY, cardW, 100, [20, 20, 0, 0]);
   ctx.fill();
 
-  // Gold accent line under banner
   ctx.fillStyle = '#facc15';
   ctx.fillRect(cardX, cardY + 97, cardW, 4);
 
-  // Header Title
   ctx.font = '900 44px "Plus Jakarta Sans", sans-serif';
   ctx.fillStyle = '#ffffff';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.shadowColor = 'rgba(0, 0, 0, 0.7)';
-  ctx.shadowBlur = 10;
   ctx.fillText('TITOLI DI CODA · FINE TRASMISSIONE', W / 2, cardY + 50);
-  ctx.shadowColor = 'transparent';
 
-  // Content Credits List
   const startY = cardY + 175;
   const rows = [
     { role: 'EDIZIONE NOTIZIARIO', val: credits.edition || 'Edizione Straordinaria TG Studio HD' },
     { role: 'CONDUTTORE IN STUDIO', val: anchor.name },
     { role: 'REDAZIONE GIORNALISTICA', val: credits.production || 'Redazione Notizie Internazionali HD' },
     { role: 'REGIA & PRODUZIONE', val: credits.director || 'Studio TG Broadcast' },
-    { role: 'SINTESI VOCALE & LIP-SYNC', val: credits.audioTech || 'Google Text-to-Speech & Lip-Sync Neurale' },
+    { role: 'SINTESI VOCALE & LIP-SYNC', val: credits.audioTech || 'Voci Google / Android & Lip-Sync Studio' },
   ];
 
   ctx.textAlign = 'center';
   rows.forEach((row, idx) => {
     const yPos = startY + idx * 92;
 
-    // Role Tag (Cyan)
     ctx.font = '800 24px "Plus Jakarta Sans", sans-serif';
-    ctx.fillStyle = '#38bdf8'; // Bright Sky Blue
+    ctx.fillStyle = '#38bdf8';
     ctx.fillText(row.role.toUpperCase(), W / 2, yPos);
 
-    // Value Name (Large Bold White)
     ctx.font = '900 38px "Plus Jakarta Sans", sans-serif';
     ctx.fillStyle = '#ffffff';
     ctx.fillText(row.val, W / 2, yPos + 38);
 
-    // Hairline divider
     if (idx < rows.length - 1) {
       ctx.fillStyle = 'rgba(255, 255, 255, 0.12)';
       ctx.fillRect(W / 2 - 340, yPos + 66, 680, 1.5);
     }
   });
 
-  // Closing Sign-Off Message
   if (credits.customNotes) {
     ctx.font = 'italic 700 30px "Plus Jakarta Sans", sans-serif';
-    ctx.fillStyle = '#facc15'; // Gold
+    ctx.fillStyle = '#facc15';
     ctx.fillText(`“${credits.customNotes}”`, W / 2, cardY + cardH - 55);
   }
 

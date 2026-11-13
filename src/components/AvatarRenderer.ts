@@ -550,16 +550,17 @@ function drawCustomPhotoAnchor(
   const drawX = -targetW / 2;
   const drawY = -targetH / 2 + 15;
 
-  // Outer broadcast portrait shadow
+  // Lightweight broadcast portrait drop-shadow (avoids expensive per-frame Gaussian shadowBlur)
   ctx.save();
-  ctx.shadowColor = 'rgba(0, 0, 0, 0.65)';
-  ctx.shadowBlur = 24;
-  ctx.shadowOffsetY = 10;
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.42)';
+  ctx.beginPath();
+  ctx.roundRect(drawX + 6, drawY + 12, targetW, targetH, 18);
+  ctx.fill();
+
   ctx.fillStyle = '#0f172a';
   ctx.beginPath();
   ctx.roundRect(drawX, drawY, targetW, targetH, 18);
   ctx.fill();
-  ctx.shadowColor = 'transparent';
 
   // Draw portrait image clipped
   ctx.save();

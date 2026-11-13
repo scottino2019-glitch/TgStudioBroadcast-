@@ -100,6 +100,115 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
+function splitTextForTtsChunks(text: string, maxLen = 170): string[] {
+  const cleaned = text.replace(/\s+/g, ' ').trim();
+  if (!cleaned) return [];
+  if (cleaned.length <= maxLen) return [cleaned];
+
+  const sentences = cleaned.match(/[^.!?;:。！？；]+[.!?;:。！？；]*/g) || [cleaned];
+  const chunks: string[] = [];
+  let buffer = '';
+
+  for (const rawSentence of sentences) {
+    const sentence = rawSentence.trim();
+    if (!sentence) continue;
+
+    if (sentence.length > maxLen) {
+      if (buffer) {
+        chunks.push(buffer.trim());
+        buffer = '';
+      }
+      const words = sentence.split(/\s+/);
+      let wordBuf = '';
+      for (const word of words) {
+        if ((wordBuf + ' ' + word).trim().length <= maxLen) {
+          wordBuf = (wordBuf + ' ' + word).trim();
+        } else {
+          if (wordBuf) chunks.push(wordBuf);
+          wordBuf = word.slice(0, maxLen);
+        }
+      }
+      if (wordBuf) chunks.push(wordBuf);
+      continue;
+    }
+
+    if ((buffer + ' ' + sentence).trim().length <= maxLen) {
+      buffer = (buffer + ' ' + sentence).trim();
+    } else {
+      if (buffer) chunks.push(buffer.trim());
+      buffer = sentence;
+    }
+  }
+
+  if (buffer.trim()) {
+    chunks.push(buffer.trim());
+  }
+
+  return chunks;
+}
+
+function mapToGoogleTtsLang(langTag: string | undefined): string {
+  const norm = (langTag || 'it-IT').trim().replace(/_/g, '-');
+  const lower = norm.toLowerCase();
+  if (lower.startsWith('zh')) return 'zh-CN';
+  if (lower === 'en-gb') return 'en-GB';
+  return lower.split('-')[0] || 'it';
+}
+
+// Zero-config, zero-token Google Studio TTS audio endpoint (returns MP3 chunks recordable in MediaRecorder)
+app.post('/api/free-tts', async (req, res) => {
+  try {
+    const { text, lang = 'it-IT' } = req.body || {};
+    if (!text || typeof text !== 'string' || !text.trim()) {
+      return res.status(400).json({ error: 'Testo mancante per la sintesi vocale.' });
+    }
+
+    const tl = mapToGoogleTtsLang(lang);
+    const textChunks = splitTextForTtsChunks(text, 170);
+    if (textChunks.length === 0) {
+      return res.status(400).json({ error: 'Copione vuoto.' });
+    }
+
+    const audioChunks: string[] = [];
+    for (const chunkText of textChunks) {
+      const ttsUrl = `https://translate.google.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
+        chunkText
+      )}&tl=${encodeURIComponent(tl)}&client=tw-ob`;
+
+      const response = await fetch(ttsUrl, {
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+          Accept: 'audio/mpeg,audio/*;q=0.9,*/*;q=0.8',
+        },
+      });
+
+      if (!response.ok) {
+        return res.status(502).json({
+          error: `Sintesi audio temporaneamente non disponibile (HTTP ${response.status}).`,
+        });
+      }
+
+      const arrBuf = await response.arrayBuffer();
+      if (!arrBuf || arrBuf.byteLength === 0) {
+        return res.status(502).json({ error: 'Flusso audio ricevuto vuoto.' });
+      }
+      audioChunks.push(Buffer.from(arrBuf).toString('base64'));
+    }
+
+    return res.json({
+      chunks: audioChunks,
+      mimeType: 'audio/mpeg',
+      lang: tl,
+    });
+  } catch (error: any) {
+    console.error('Errore /api/free-tts:', error);
+    return res.status(500).json({
+      error: error?.message || 'Errore durante la generazione audio.',
+    });
+  }
+});
+
 // AI News Script Generator
 app.post('/api/generate-news', async (req, res) => {
   const { topic, language = 'Italian', tone = 'authoritative', anchorGender = 'male' } = req.body;
