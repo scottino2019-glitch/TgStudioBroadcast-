@@ -238,8 +238,8 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = React.memo(({
         return;
       }
 
-      // Pace to ~30 FPS (~26ms threshold -> draws every 2nd tick on 60Hz, every 4th on 120Hz)
-      if (lastDrawTimeRef.current > 0 && now - lastDrawTimeRef.current < 26) {
+      // Pace cleanly to ~30 FPS without jitter
+      if (lastDrawTimeRef.current > 0 && now - lastDrawTimeRef.current < 30) {
         return;
       }
       lastDrawTimeRef.current = now;
@@ -441,7 +441,7 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = React.memo(({
       {/* Live Speaking Indicator in corner */}
       {visemeMetrics.isSpeaking && (
         <div className="absolute top-4 left-4 flex items-center gap-2 bg-slate-950/85 backdrop-blur-md px-3 py-1.5 rounded-full border border-emerald-500/40 text-xs font-data text-emerald-400 z-20">
-          <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping inline-block" />
+          <span className="w-2 h-2 rounded-full bg-emerald-500 inline-block" />
           <span>LIP-SYNC ATTIVO</span>
           <span className="text-slate-400">·</span>
           <span>APERTURA {Math.round(visemeMetrics.openness * 100)}%</span>
@@ -761,7 +761,8 @@ function drawLowerThird(
   ctx.font = '900 44px "Plus Jakarta Sans", "Barlow Condensed", sans-serif';
   ctx.fillStyle = '#ffffff';
   ctx.textBaseline = 'middle';
-  ctx.fillText(cfg.headline, leftX + 32, baseY + 38, maxW - 64);
+  const headlineMaxW = cfg.anchorName ? Math.max(400, maxW - 420) : maxW - 64;
+  ctx.fillText(cfg.headline, leftX + 32, baseY + 38, headlineMaxW);
 
   if (cfg.subheadline) {
     const subH = 44;
@@ -873,7 +874,8 @@ function drawTicker(
 
   const cleanTickerText = (ticker.text || '').replace(/\s+/g, ' ').trim();
   const unitText = cleanTickerText ? `${cleanTickerText}   ●   ` : 'TG STUDIO LIVE   ●   ';
-  const measureKey = `${fontPixels}|${unitText}`;
+  const fontStatus = typeof document !== 'undefined' && document.fonts ? document.fonts.status : 'ready';
+  const measureKey = `${fontPixels}|${fontStatus}|${unitText}`;
   if (cachedTickerMeasureKey !== measureKey) {
     cachedTickerUnitWidth = Math.max(200, ctx.measureText(unitText).width);
     cachedTickerMeasureKey = measureKey;

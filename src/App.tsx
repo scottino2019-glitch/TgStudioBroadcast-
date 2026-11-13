@@ -105,6 +105,7 @@ export default function App() {
   // Video Recording state & synchronization refs
   const [isRecording, setIsRecording] = useState(false);
   const [isPreparingRecording, setIsPreparingRecording] = useState(false);
+  const [isExportingMp4, setIsExportingMp4] = useState(false);
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [recordingResult, setRecordingResult] = useState<RecordingResult | null>(null);
   const [isFinalizingCredits, setIsFinalizingCredits] = useState(false);
@@ -118,6 +119,7 @@ export default function App() {
   const speechKeepAliveRef = useRef<number | null>(null);
   const chunkWatchdogRef = useRef<number | null>(null);
   const ttsAbortRef = useRef<AbortController | null>(null);
+  const recordingAudioChunksRef = useRef<string[]>([]);
 
   // Keep refs synchronized on every render to eliminate stale closures
   stateRef.current = state;
@@ -216,7 +218,20 @@ export default function App() {
     };
   }, []);
 
-  // Seamlessly roll End Credits on canvas before finalizing video recording
+  const blobToBase64 = (blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const res = typeof reader.result === 'string' ? reader.result : '';
+        const idx = res.indexOf(',');
+        resolve(idx >= 0 ? res.slice(idx + 1) : res);
+      };
+      reader.onerror = () => reject(new Error('Errore conversione blob video.'));
+      reader.readAsDataURL(blob);
+    });
+  };
+
+  // Seamlessly roll End Credits on canvas and transcode to universal MP4 (H.264 + AAC)
   const finishRecordingWithCredits = useCallback(async () => {
     if (isFinalizingRef.current) return;
     isFinalizingRef.current = true;
@@ -226,36 +241,88 @@ export default function App() {
 
     const currentCredits = stateRef.current.endCredits;
     if (currentCredits.enabled) {
-      // Roll full-screen broadcast End Credits slate on canvas while video recorder is capturing
       setState((prev) => ({ ...prev, showCreditsNow: true }));
       const waitMs = Math.max(2500, (currentCredits.durationSec || 4.5) * 1000);
       await new Promise((r) => setTimeout(r, waitMs));
-      setState((prev) => ({ ...prev, showCreditsNow: false }));
     }
 
     try {
-      const result = await globalVideoRecorder.stopRecording();
+      // Stop recorder WHILE credits slate is still displayed so the video never flashes back to studio
+      const rawResult = await globalVideoRecorder.stopRecording();
+      setState((prev) => ({ ...prev, showCreditsNow: false }));
       setIsRecording(false);
       isRecordingRef.current = false;
       setRecordingSeconds(0);
-      setRecordingResult(result);
+
+      const audioChunks = recordingAudioChunksRef.current;
+      recordingAudioChunksRef.current = [];
+
+      // Transcode to universal MP4 (H.264 + AAC 44.1kHz stereo) so external players always recognize audio & video
+      setIsFinalizingCredits(false);
+      setIsExportingMp4(true);
+
+      try {
+        const videoBase64 = await blobToBase64(rawResult.blob);
+        const controller = new AbortController();
+        const exportTimeout = window.setTimeout(() => controller.abort(), 120000);
+
+        const mp4Res = await fetch('/api/export-mp4', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          signal: controller.signal,
+          body: JSON.stringify({
+            videoBase64,
+            videoFormat: rawResult.format,
+            audioChunks,
+          }),
+        });
+        window.clearTimeout(exportTimeout);
+
+        if (!mp4Res.ok) {
+          throw new Error(`HTTP ${mp4Res.status}`);
+        }
+
+        const mp4Blob = await mp4Res.blob();
+        if (!mp4Blob || mp4Blob.size === 0) {
+          throw new Error('File MP4 esportato vuoto.');
+        }
+
+        URL.revokeObjectURL(rawResult.url);
+        const mp4Url = URL.createObjectURL(mp4Blob);
+        const hasAudioHeader = mp4Res.headers.get('X-Has-Audio') !== 'false';
+
+        setRecordingResult({
+          blob: mp4Blob,
+          url: mp4Url,
+          durationSec: rawResult.durationSec,
+          format: 'mp4',
+          sizeBytes: mp4Blob.size,
+          hasAudio: hasAudioHeader,
+        });
+      } catch (mp4Err) {
+        console.warn('Fallback a file registrato dal browser:', mp4Err);
+        setVoiceNotice('Conversione MP4 non riuscita: esportato il file diretto dal browser.');
+        setRecordingResult(rawResult);
+      }
     } catch (err: any) {
       console.error('Errore finalizzazione video:', err);
+      setState((prev) => ({ ...prev, showCreditsNow: false }));
       setVoiceNotice(err?.message || 'Errore durante il salvataggio del video registrato.');
       setIsRecording(false);
       isRecordingRef.current = false;
       setRecordingSeconds(0);
     } finally {
+      setIsExportingMp4(false);
       setIsFinalizingCredits(false);
       isFinalizingRef.current = false;
     }
   }, []);
 
-  const fetchRecordableStudioBuffers = async (
+  const fetchRecordableStudioAudio = async (
     text: string,
     webSpeechLang: string,
     sessionId: number
-  ): Promise<AudioBuffer[]> => {
+  ): Promise<{ buffers: AudioBuffer[]; chunks: string[] }> => {
     if (ttsAbortRef.current) {
       ttsAbortRef.current.abort();
     }
@@ -287,7 +354,8 @@ export default function App() {
         throw new Error('Sessione interrotta');
       }
 
-      return await globalAudioEngine.decodeAudioChunksBase64(data.chunks);
+      const buffers = await globalAudioEngine.decodeAudioChunksBase64(data.chunks);
+      return { buffers, chunks: data.chunks };
     } finally {
       window.clearTimeout(timeoutId);
       if (ttsAbortRef.current === controller) {
@@ -314,7 +382,7 @@ export default function App() {
     setIsLoadingVoice(true);
 
     try {
-      const buffers = await fetchRecordableStudioBuffers(
+      const { buffers } = await fetchRecordableStudioAudio(
         text,
         currentLanguage.webSpeechLang,
         sessionId
@@ -519,12 +587,15 @@ export default function App() {
       }
 
       let buffers: AudioBuffer[] = [];
+      let chunks: string[] = [];
       try {
-        buffers = await fetchRecordableStudioBuffers(
+        const audioData = await fetchRecordableStudioAudio(
           text,
           currentLanguage.webSpeechLang,
           sessionId
         );
+        buffers = audioData.buffers;
+        chunks = audioData.chunks;
       } catch (audioErr: any) {
         console.error('Impossibile preparare audio registrabile:', audioErr);
         setVoiceNotice(
@@ -535,11 +606,13 @@ export default function App() {
 
       if (speechSessionRef.current !== sessionId) return;
 
+      recordingAudioChunksRef.current = chunks;
       const started = globalVideoRecorder.startRecording(canvas, audioStream, (secs) => {
         setRecordingSeconds(secs);
       });
 
       if (!started) {
+        recordingAudioChunksRef.current = [];
         setVoiceNotice('Impossibile avviare la registrazione video su questo browser.');
         return;
       }
@@ -584,6 +657,7 @@ export default function App() {
         onToggleRecord={handleToggleRecord}
         isFinalizing={isFinalizingCredits}
         isPreparingRecording={isPreparingRecording}
+        isExportingMp4={isExportingMp4}
       />
 
       {/* Main Studio Workspace */}
@@ -592,9 +666,9 @@ export default function App() {
         <div className="xl:col-span-7 space-y-4">
           <div className="flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+              <span className="w-2 h-2 rounded-full bg-emerald-500" />
               <h1 className="text-sm font-bold uppercase tracking-wider text-slate-300">
-                Monitor Regia Broadcast (1080p 60FPS)
+                Monitor Regia Broadcast (1080p HD)
               </h1>
             </div>
             <div className="flex items-center gap-2 text-xs text-slate-400 font-data">
@@ -604,12 +678,19 @@ export default function App() {
             </div>
           </div>
 
-          {/* Banner during credits recording */}
+          {/* Steady Banners during credits recording or MP4 conversion (no flashing) */}
           {isFinalizingCredits && (
-            <div className="flex items-center gap-2.5 p-3 bg-amber-950/90 border border-amber-500/70 rounded-xl text-xs text-amber-200 shadow-xl animate-pulse">
-              <span className="w-2.5 h-2.5 rounded-full bg-amber-400 animate-ping shrink-0" />
+            <div className="flex items-center gap-2.5 p-3 bg-amber-950/90 border border-amber-500/70 rounded-xl text-xs text-amber-200 shadow-xl">
+              <span className="w-2.5 h-2.5 rounded-full bg-amber-400 shrink-0" />
               <span className="font-bold uppercase tracking-wide">Registrazione Titoli di Coda:</span>
-              <span className="text-amber-200/90">La schermata finale con i crediti è in acquisizione nel file video. Il download apparirà tra pochi secondi...</span>
+              <span className="text-amber-200/90">Acquisizione della schermata finale in corso...</span>
+            </div>
+          )}
+          {isExportingMp4 && (
+            <div className="flex items-center gap-2.5 p-3 bg-emerald-950/90 border border-emerald-500/70 rounded-xl text-xs text-emerald-200 shadow-xl">
+              <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shrink-0" />
+              <span className="font-bold uppercase tracking-wide">Esportazione MP4 Universale:</span>
+              <span className="text-emerald-200/90">Codifica video H.264 + audio AAC compatibile con tutti i dispositivi...</span>
             </div>
           )}
 
@@ -653,20 +734,24 @@ export default function App() {
 
               <button
                 onClick={handleToggleRecord}
-                disabled={isFinalizingCredits || isPreparingRecording}
+                disabled={isFinalizingCredits || isPreparingRecording || isExportingMp4}
                 className={`px-3.5 py-1.5 font-bold rounded-lg transition-colors flex items-center gap-1.5 shadow-sm disabled:opacity-70 ${
-                  isFinalizingCredits
-                    ? 'bg-amber-600 text-white animate-pulse'
+                  isExportingMp4
+                    ? 'bg-emerald-600 text-white'
+                    : isFinalizingCredits
+                    ? 'bg-amber-600 text-white'
                     : isPreparingRecording
-                    ? 'bg-sky-700 text-white animate-pulse'
+                    ? 'bg-sky-700 text-white'
                     : isRecording
-                    ? 'bg-rose-600 text-white animate-pulse'
+                    ? 'bg-rose-600 text-white'
                     : 'bg-sky-600 hover:bg-sky-500 text-white'
                 }`}
               >
                 <Video className="w-3.5 h-3.5" />
                 <span>
-                  {isFinalizingCredits
+                  {isExportingMp4
+                    ? 'Creazione MP4...'
+                    : isFinalizingCredits
                     ? 'Titoli di Coda in Corso...'
                     : isPreparingRecording
                     ? 'Preparazione Audio...'

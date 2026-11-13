@@ -1,5 +1,5 @@
 import React from 'react';
-import { Radio, Video, Square } from 'lucide-react';
+import { Radio, Video, Square, Loader2 } from 'lucide-react';
 
 export type ActiveStudioTab = 'direct' | 'script' | 'avatar' | 'media' | 'graphics';
 
@@ -11,6 +11,7 @@ interface TopBarProps {
   onToggleRecord: () => void;
   isFinalizing?: boolean;
   isPreparingRecording?: boolean;
+  isExportingMp4?: boolean;
 }
 
 export const TopBar: React.FC<TopBarProps> = ({
@@ -21,6 +22,7 @@ export const TopBar: React.FC<TopBarProps> = ({
   onToggleRecord,
   isFinalizing,
   isPreparingRecording,
+  isExportingMp4,
 }) => {
   const mins = Math.floor(recordingSeconds / 60);
   const secs = Math.floor(recordingSeconds % 60);
@@ -80,21 +82,25 @@ export const TopBar: React.FC<TopBarProps> = ({
 
       {/* Zone 3: 1 primary action */}
       <div className="flex items-center gap-3 shrink-0">
-
-        {isFinalizing ? (
-          <div className="px-4 py-2 text-xs font-bold text-amber-300 bg-amber-950/80 border border-amber-500/60 rounded-lg flex items-center gap-2 animate-pulse whitespace-nowrap">
-            <span className="w-2 h-2 rounded-full bg-amber-400 animate-ping" />
+        {isExportingMp4 ? (
+          <div className="px-4 py-2 text-xs font-bold text-emerald-300 bg-emerald-950/80 border border-emerald-500/60 rounded-lg flex items-center gap-2 whitespace-nowrap">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            <span>Creazione MP4 Audio+Video...</span>
+          </div>
+        ) : isFinalizing ? (
+          <div className="px-4 py-2 text-xs font-bold text-amber-300 bg-amber-950/80 border border-amber-500/60 rounded-lg flex items-center gap-2 whitespace-nowrap">
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
             <span>Registrazione Titoli di Coda...</span>
           </div>
         ) : isPreparingRecording ? (
-          <div className="px-4 py-2 text-xs font-bold text-sky-300 bg-sky-950/80 border border-sky-500/60 rounded-lg flex items-center gap-2 animate-pulse whitespace-nowrap">
+          <div className="px-4 py-2 text-xs font-bold text-sky-300 bg-sky-950/80 border border-sky-500/60 rounded-lg flex items-center gap-2 whitespace-nowrap">
             <Radio className="w-3.5 h-3.5 animate-spin" />
             <span>Preparazione Audio HD...</span>
           </div>
         ) : isRecording ? (
           <button
             onClick={onToggleRecord}
-            className="px-4 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors flex items-center gap-2 shadow-lg shadow-rose-900/40 whitespace-nowrap animate-pulse"
+            className="px-4 py-2 text-xs font-bold text-white bg-rose-600 hover:bg-rose-500 rounded-lg transition-colors flex items-center gap-2 shadow-lg shadow-rose-900/40 whitespace-nowrap"
           >
             <Square className="w-3.5 h-3.5 fill-current" />
             <span>Interrompi REC ({timeFormatted})</span>

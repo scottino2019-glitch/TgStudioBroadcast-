@@ -2,10 +2,16 @@ import express from 'express';
 import http from 'http';
 import dotenv from 'dotenv';
 import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import crypto from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
 import { fileURLToPath } from 'url';
 
 dotenv.config();
 
+const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -20,6 +26,7 @@ app.get('/api/status', (_req, res) => {
   res.json({
     status: 'ok',
     ttsEngine: 'google-translate-tts',
+    mp4Export: true,
   });
 });
 
@@ -115,7 +122,7 @@ async function fetchTtsChunkWithRetry(chunkText: string, tl: string): Promise<st
   throw lastError || new Error('Errore durante il recupero audio TTS.');
 }
 
-// Zero-config, zero-token Google Studio TTS audio endpoint (returns MP3 chunks recordable in MediaRecorder)
+// Zero-config, zero-token Google Studio TTS audio endpoint
 app.post('/api/free-tts', async (req, res) => {
   try {
     const { text, lang = 'it-IT' } = req.body || {};
@@ -129,7 +136,6 @@ app.post('/api/free-tts', async (req, res) => {
       return res.status(400).json({ error: 'Copione vuoto.' });
     }
 
-    // Fetch in bounded batches of 3 for speed without stalling or rate-limiting
     const audioChunks: string[] = [];
     for (let i = 0; i < textChunks.length; i += 3) {
       const batch = textChunks.slice(i, i + 3);
@@ -149,6 +155,121 @@ app.post('/api/free-tts', async (req, res) => {
     return res.status(502).json({
       error: error?.message || 'Errore durante la generazione audio.',
     });
+  }
+});
+
+// Universal MP4 (H.264 + AAC Stereo 44.1kHz) muxer & transcoder so exported video & audio work in EVERY external player
+app.post('/api/export-mp4', express.json({ limit: '250mb' }), async (req, res) => {
+  const tmpDir = path.join(os.tmpdir(), `tgstudio-export-${crypto.randomUUID()}`);
+
+  try {
+    const { videoBase64, videoFormat = 'webm', audioChunks } = req.body || {};
+    if (!videoBase64 || typeof videoBase64 !== 'string') {
+      return res.status(400).json({ error: 'Dati video mancanti per esportazione MP4.' });
+    }
+
+    await fs.promises.mkdir(tmpDir, { recursive: true });
+    const safeExt = videoFormat === 'mp4' ? 'mp4' : 'webm';
+    const inputVideoPath = path.join(tmpDir, `input.${safeExt}`);
+    const outputMp4Path = path.join(tmpDir, 'output.mp4');
+
+    await fs.promises.writeFile(inputVideoPath, Buffer.from(videoBase64, 'base64'));
+
+    const validChunks = Array.isArray(audioChunks)
+      ? audioChunks.filter((c): c is string => typeof c === 'string' && c.length > 0)
+      : [];
+
+    let hasAudioOutput = false;
+
+    if (validChunks.length > 0) {
+      const concatEntries: string[] = [];
+      for (let i = 0; i < validChunks.length; i++) {
+        const chunkPath = path.join(tmpDir, `chunk_${i}.mp3`);
+        await fs.promises.writeFile(chunkPath, Buffer.from(validChunks[i], 'base64'));
+        concatEntries.push(`file '${chunkPath.replace(/'/g, "'\\''")}'`);
+      }
+
+      const concatListPath = path.join(tmpDir, 'concat.txt');
+      await fs.promises.writeFile(concatListPath, concatEntries.join('\n') + '\n', 'utf-8');
+
+      await execFileAsync(
+        'ffmpeg',
+        [
+          '-y',
+          '-fflags', '+genpts',
+          '-i', inputVideoPath,
+          '-f', 'concat',
+          '-safe', '0',
+          '-i', concatListPath,
+          '-filter_complex', '[1:a]aresample=async=1:first_pts=0,apad[aout]',
+          '-map', '0:v:0',
+          '-map', '[aout]',
+          '-c:v', 'libx264',
+          '-preset', 'ultrafast',
+          '-crf', '22',
+          '-pix_fmt', 'yuv420p',
+          '-vsync', 'cfr',
+          '-r', '30',
+          '-c:a', 'aac',
+          '-b:a', '192k',
+          '-ar', '44100',
+          '-ac', '2',
+          '-shortest',
+          '-movflags', '+faststart',
+          outputMp4Path,
+        ],
+        { timeout: 120000, maxBuffer: 10 * 1024 * 1024 }
+      );
+      hasAudioOutput = true;
+    } else {
+      // Check if input video itself has an audio stream
+      let inputHasAudio = false;
+      try {
+        const { stdout } = await execFileAsync('ffprobe', [
+          '-v', 'error',
+          '-select_streams', 'a',
+          '-show_entries', 'stream=codec_type',
+          '-of', 'csv=p=0',
+          inputVideoPath,
+        ]);
+        inputHasAudio = stdout.trim().includes('audio');
+      } catch {
+        inputHasAudio = false;
+      }
+
+      const ffmpegArgs = [
+        '-y',
+        '-fflags', '+genpts',
+        '-i', inputVideoPath,
+        '-map', '0:v:0',
+        ...(inputHasAudio ? ['-map', '0:a:0'] : []),
+        '-c:v', 'libx264',
+        '-preset', 'ultrafast',
+        '-crf', '22',
+        '-pix_fmt', 'yuv420p',
+        '-vsync', 'cfr',
+        '-r', '30',
+        ...(inputHasAudio ? ['-c:a', 'aac', '-b:a', '192k', '-ar', '44100', '-ac', '2'] : []),
+        '-movflags', '+faststart',
+        outputMp4Path,
+      ];
+
+      await execFileAsync('ffmpeg', ffmpegArgs, { timeout: 120000, maxBuffer: 10 * 1024 * 1024 });
+      hasAudioOutput = inputHasAudio;
+    }
+
+    const mp4Buffer = await fs.promises.readFile(outputMp4Path);
+    res.setHeader('Content-Type', 'video/mp4');
+    res.setHeader('Content-Length', String(mp4Buffer.length));
+    res.setHeader('X-Has-Audio', hasAudioOutput ? 'true' : 'false');
+    return res.send(mp4Buffer);
+  } catch (error: any) {
+    console.error('Errore /api/export-mp4:', error);
+    return res.status(500).json({
+      error: error?.message || 'Errore durante la conversione MP4 con FFmpeg.',
+    });
+  } finally {
+    fs.promises.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
   }
 });
 

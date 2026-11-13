@@ -4,10 +4,10 @@ export class AudioLipSyncEngine {
   private audioCtx: AudioContext | null = null;
   private analyser: AnalyserNode | null = null;
   private playbackGain: GainNode | null = null;
-  private currentSource: AudioBufferSourceNode | null = null;
+  private scheduledSources: AudioBufferSourceNode[] = [];
   private mediaStreamDest: MediaStreamAudioDestinationNode | null = null;
   private animationId: number | null = null;
-  private chunkSafetyTimer: number | null = null;
+  private playbackWatchdogTimer: number | null = null;
   private isPlaying = false;
   private onMetricsUpdate: ((metrics: VisemeMetrics) => void) | null = null;
   private onEndedCallback: (() => void) | null = null;
@@ -43,9 +43,6 @@ export class AudioLipSyncEngine {
       this.playbackGain.connect(this.mediaStreamDest);
     }
     if (!this.keepAliveStarted) {
-      // Pump an ultra-quiet (-90dB) carrier into mediaStreamDest ONLY (never speakers)
-      // so Chromium/Android/Safari MediaRecorder Opus/AAC muxers never drop the audio track
-      // during silent intervals or end-credits slate.
       const osc = ctx.createOscillator();
       osc.frequency.value = 20;
       const carrierGain = ctx.createGain();
@@ -108,10 +105,6 @@ export class AudioLipSyncEngine {
     return bytes.buffer;
   }
 
-  /**
-   * Decodes base64 audio chunks into AudioBuffers upfront so recording can begin
-   * at the exact millisecond audio playback starts (no silent fetch delay in video).
-   */
   public async decodeAudioChunksBase64(base64Chunks: string[]): Promise<AudioBuffer[]> {
     const ctx = this.initContext();
     this.ensureRoutingNodes(ctx);
@@ -119,7 +112,7 @@ export class AudioLipSyncEngine {
       try {
         await ctx.resume();
       } catch {
-        // Continue; decoding works even before resume completes
+        // Continue
       }
     }
 
@@ -132,6 +125,10 @@ export class AudioLipSyncEngine {
     return buffers;
   }
 
+  /**
+   * Sample-accurate gapless scheduling on Web Audio timeline so live playback
+   * matches FFmpeg's concatenated MP3 audio track down to the millisecond.
+   */
   public async playAudioBuffers(
     buffers: AudioBuffer[],
     onFrame: (metrics: VisemeMetrics) => void,
@@ -175,61 +172,34 @@ export class AudioLipSyncEngine {
       onEnded?.();
     };
 
-    const playIndex = (idx: number) => {
-      if (sessionId !== this.playbackSessionId) return;
-      if (idx >= buffers.length) {
-        finishOnce();
-        return;
-      }
+    let scheduledTime = ctx.currentTime + 0.02;
+    let totalDuration = 0;
+    const sources: AudioBufferSourceNode[] = [];
 
-      if (this.chunkSafetyTimer !== null) {
-        window.clearTimeout(this.chunkSafetyTimer);
-        this.chunkSafetyTimer = null;
-      }
+    for (let i = 0; i < buffers.length; i++) {
+      const buf = buffers[i];
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(gain);
+      src.connect(analyser);
+      src.start(scheduledTime);
+      sources.push(src);
+      scheduledTime += buf.duration;
+      totalDuration += buf.duration;
+    }
 
-      const audioBuffer = buffers[idx];
-      const source = ctx.createBufferSource();
-      source.buffer = audioBuffer;
-      // Route directly to playbackGain (speakers + MediaRecorder) AND in parallel to analyser
-      source.connect(gain);
-      source.connect(analyser);
-      this.currentSource = source;
+    this.scheduledSources = sources;
 
-      let advanced = false;
-      const advance = () => {
-        if (advanced || sessionId !== this.playbackSessionId) return;
-        advanced = true;
-        if (this.chunkSafetyTimer !== null) {
-          window.clearTimeout(this.chunkSafetyTimer);
-          this.chunkSafetyTimer = null;
-        }
-        this.currentSource = null;
-        try {
-          source.disconnect();
-        } catch {
-          // Ignore
-        }
-        if (idx + 1 < buffers.length) {
-          playIndex(idx + 1);
-        } else {
-          finishOnce();
-        }
-      };
+    const lastSource = sources[sources.length - 1];
+    if (lastSource) {
+      lastSource.onended = finishOnce;
+    }
 
-      source.onended = advance;
-      // Safety watchdog in case browser misses onended during background/load spikes
-      const timeoutMs = Math.max(1500, Math.ceil(audioBuffer.duration * 1000) + 1200);
-      this.chunkSafetyTimer = window.setTimeout(advance, timeoutMs);
-
-      try {
-        source.start(0);
-      } catch (startErr) {
-        console.warn('Errore avvio sorgente audio:', startErr);
-        advance();
-      }
-    };
-
-    playIndex(0);
+    // Watchdog in case browser misses onended when tab loses focus
+    this.playbackWatchdogTimer = window.setTimeout(
+      finishOnce,
+      Math.max(1500, Math.ceil(totalDuration * 1000) + 900)
+    );
   }
 
   public async playAudioChunksBase64(
@@ -245,7 +215,6 @@ export class AudioLipSyncEngine {
     await this.playAudioBuffers(buffers, onFrame, onEnded);
   }
 
-  // Fallback simulator for Web Speech API or test preview
   public startSpeechSimulation(
     estimatedDurationSec: number,
     onFrame: (metrics: VisemeMetrics) => void,
@@ -269,7 +238,6 @@ export class AudioLipSyncEngine {
         return;
       }
 
-      // Procedural natural speech rhythms (syllables ~ 4Hz - 6Hz)
       const t = elapsed / 1000;
       const syllableWave = Math.sin(t * 14) * 0.4 + Math.sin(t * 22) * 0.3 + Math.sin(t * 7) * 0.3;
       const pauseModulation = Math.sin(t * 1.5) > -0.6 ? 1 : 0.15;
@@ -377,24 +345,24 @@ export class AudioLipSyncEngine {
   public stop() {
     this.playbackSessionId += 1;
     this.isPlaying = false;
-    if (this.chunkSafetyTimer !== null) {
-      window.clearTimeout(this.chunkSafetyTimer);
-      this.chunkSafetyTimer = null;
+    if (this.playbackWatchdogTimer !== null) {
+      window.clearTimeout(this.playbackWatchdogTimer);
+      this.playbackWatchdogTimer = null;
     }
     if (this.animationId) {
       cancelAnimationFrame(this.animationId);
       this.animationId = null;
     }
-    if (this.currentSource) {
+    for (const src of this.scheduledSources) {
       try {
-        this.currentSource.onended = null;
-        this.currentSource.stop();
-        this.currentSource.disconnect();
+        src.onended = null;
+        src.stop();
+        src.disconnect();
       } catch {
         // Ignore already stopped sources
       }
-      this.currentSource = null;
     }
+    this.scheduledSources = [];
 
     this.smoothedOpenness = 0;
     this.smoothedWidth = 0.5;
