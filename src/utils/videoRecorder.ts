@@ -60,7 +60,7 @@ export class VideoRecorderManager {
         return {
           recorder: new MediaRecorder(combinedStream, {
             mimeType: supportedMime,
-            videoBitsPerSecond: 3_500_000,
+            videoBitsPerSecond: 2_200_000,
             ...(addedAudio ? { audioBitsPerSecond: 128_000 } : {}),
           }),
           hasAudio: addedAudio,

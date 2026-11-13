@@ -595,6 +595,7 @@ export default function App() {
 
       let buffers: AudioBuffer[] = [];
       let chunks: string[] = [];
+      let useWebSpeechFallback = false;
       try {
         const audioData = await fetchRecordableStudioAudio(
           text,
@@ -604,12 +605,11 @@ export default function App() {
         buffers = audioData.buffers;
         chunks = audioData.chunks;
       } catch (audioErr: any) {
-        console.error('Impossibile preparare audio registrabile:', audioErr);
-        const detail = audioErr?.message ? ` (${audioErr.message})` : '';
-        setVoiceNotice(
-          `Audio TTS non raggiungibile al momento${detail}: impossibile registrare la voce nel video.`
-        );
-        return;
+        if (speechSessionRef.current !== sessionId) {
+          return;
+        }
+        console.warn('TTS server non disponibile, passaggio a modalità Web Speech durante registrazione:', audioErr);
+        useWebSpeechFallback = true;
       }
 
       if (speechSessionRef.current !== sessionId) return;
@@ -628,6 +628,15 @@ export default function App() {
       setTestMouthOpen(false);
       isRecordingRef.current = true;
       setIsRecording(true);
+
+      if (useWebSpeechFallback) {
+        setVoiceNotice(
+          'Server TTS non attivo su questo URL: registrazione avviata con voce locale del browser e lip-sync in tempo reale.'
+        );
+        playWebSpeech();
+        return;
+      }
+
       setIsPlayingSpeech(true);
 
       await globalAudioEngine.playAudioBuffers(
