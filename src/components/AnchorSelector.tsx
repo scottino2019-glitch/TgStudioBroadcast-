@@ -10,6 +10,8 @@ interface AnchorSelectorProps {
   currentAnchor: AnchorProfile;
   customAnchor: AnchorProfile | null;
   onUpdateCustomAnchor: (anchor: AnchorProfile) => void;
+  testMouthOpen?: boolean;
+  onToggleTestMouth?: () => void;
 }
 
 export const AnchorSelector: React.FC<AnchorSelectorProps> = ({
@@ -18,10 +20,14 @@ export const AnchorSelector: React.FC<AnchorSelectorProps> = ({
   currentAnchor,
   customAnchor,
   onUpdateCustomAnchor,
+  testMouthOpen = false,
+  onToggleTestMouth,
 }) => {
   const photoFileInputRef = useRef<HTMLInputElement | null>(null);
   const [isOptimizingPhoto, setIsOptimizingPhoto] = useState(false);
   const [photoError, setPhotoError] = useState<string | null>(null);
+  const [photoAspect, setPhotoAspect] = useState<{ nw: number; nh: number }>({ nw: 280, nh: 360 });
+  const isDraggingMouthRef = useRef(false);
 
   const handlePhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -50,7 +56,7 @@ export const AnchorSelector: React.FC<AnchorSelectorProps> = ({
         avatarType: 'custom',
         avatarStyle: 'marco',
         customImageUrl: optimizedUrl,
-        mouthPosition: customAnchor?.mouthPosition || { x: 0, y: 35, scale: 1.1 },
+        mouthPosition: customAnchor?.mouthPosition || { x: 0, y: -25, scale: 1.1 },
         defaultVoice: state.selectedVoice,
         accentColor: '#38bdf8',
       };
@@ -73,17 +79,42 @@ export const AnchorSelector: React.FC<AnchorSelectorProps> = ({
     }
   };
 
-  const handleUpdateMouthCalibration = (patch: { x?: number; y?: number; scale?: number }) => {
+  const handleUpdateMouthCalibration = (
+    patch: { x?: number; y?: number; scale?: number; gender?: 'male' | 'female' }
+  ) => {
     if (!customAnchor) return;
-    const current = customAnchor.mouthPosition || { x: 0, y: 35, scale: 1.1 };
+    const current = customAnchor.mouthPosition || { x: 0, y: -25, scale: 1.1 };
     const updated: AnchorProfile = {
       ...customAnchor,
+      gender: patch.gender ?? customAnchor.gender,
       mouthPosition: {
-        ...current,
-        ...patch,
+        x: patch.x !== undefined ? patch.x : current.x,
+        y: patch.y !== undefined ? patch.y : current.y,
+        scale: patch.scale !== undefined ? patch.scale : current.scale,
       },
     };
     onUpdateCustomAnchor(updated);
+  };
+
+  // Exact match with AvatarRenderer.ts drawCustomPhotoAnchor geometry
+  const safeNw = photoAspect.nw > 0 ? photoAspect.nw : 280;
+  const safeNh = photoAspect.nh > 0 ? photoAspect.nh : 360;
+  const previewTargetW = 280;
+  const previewTargetH = Math.min(400, Math.max(190, (safeNh / safeNw) * previewTargetW));
+  const previewDrawX = -previewTargetW / 2;
+  const previewDrawY = -previewTargetH / 2 + 15;
+
+  const updateMouthFromPointer = (e: React.PointerEvent<HTMLDivElement>) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return;
+    const relX = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
+    const relY = Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height));
+    const calcX = Math.round(previewDrawX + relX * previewTargetW);
+    const calcY = Math.round(previewDrawY + relY * previewTargetH);
+    handleUpdateMouthCalibration({
+      x: Math.max(-135, Math.min(135, calcX)),
+      y: Math.max(-180, Math.min(160, calcY)),
+    });
   };
 
   return (
@@ -225,69 +256,190 @@ export const AnchorSelector: React.FC<AnchorSelectorProps> = ({
 
       {/* 2. CUSTOM AVATAR CALIBRATION (Shown when custom photo anchor is selected) */}
       {currentAnchor.avatarType === 'custom' && customAnchor && (
-        <div className="bg-slate-900/90 rounded-xl p-4 border border-amber-600/40 space-y-3">
-          <div className="flex items-center justify-between">
+        <div className="bg-slate-900/90 rounded-xl p-4 border border-amber-600/40 space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-amber-300">
               <Sliders className="w-4 h-4 text-amber-400" />
               <span>Calibrazione Posizione Bocca Parlante (Lip-Sync)</span>
             </div>
-            <button
-              onClick={() => handleUpdateMouthCalibration({ x: 0, y: 35, scale: 1.1 })}
-              className="text-xs text-slate-400 hover:text-white flex items-center gap-1"
-            >
-              <RefreshCw className="w-3 h-3" />
-              <span>Ripristina</span>
-            </button>
+            <div className="flex items-center gap-2">
+              {onToggleTestMouth && (
+                <button
+                  type="button"
+                  onClick={onToggleTestMouth}
+                  className={`px-2.5 py-1 rounded-lg text-xs font-semibold transition-colors ${
+                    testMouthOpen
+                      ? 'bg-emerald-600 text-white shadow-sm'
+                      : 'bg-slate-800 text-amber-300 hover:bg-slate-700'
+                  }`}
+                >
+                  {testMouthOpen ? 'Chiudi Test Bocca' : 'Testa Bocca Aperta'}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => handleUpdateMouthCalibration({ x: 0, y: -25, scale: 1.1 })}
+                className="text-xs text-slate-400 hover:text-white flex items-center gap-1"
+              >
+                <RefreshCw className="w-3 h-3" />
+                <span>Ripristina</span>
+              </button>
+            </div>
           </div>
 
-          <p className="text-xs text-slate-400">
-            Regola i cursori per allineare perfettamente le labbra parlanti sulla tua fotografia:
-          </p>
-
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 pt-1">
-            <div>
-              <div className="flex justify-between text-xs text-slate-300 mb-1">
-                <span>Posizione Orizzontale (X):</span>
-                <span className="font-data">{customAnchor.mouthPosition?.x ?? 0}px</span>
+          <div className="flex flex-col sm:flex-row gap-4 items-start">
+            {/* Interactive Tap / Drag-to-Place Photo Preview */}
+            {customAnchor.customImageUrl && (
+              <div className="shrink-0 mx-auto sm:mx-0 space-y-1.5">
+                <div
+                  onPointerDown={(e) => {
+                    isDraggingMouthRef.current = true;
+                    try {
+                      e.currentTarget.setPointerCapture?.(e.pointerId);
+                    } catch {
+                      // Ignore unsupported pointer capture on some mobile WebViews
+                    }
+                    updateMouthFromPointer(e);
+                  }}
+                  onPointerMove={(e) => {
+                    if (!isDraggingMouthRef.current) return;
+                    updateMouthFromPointer(e);
+                  }}
+                  onPointerUp={() => {
+                    isDraggingMouthRef.current = false;
+                  }}
+                  onPointerCancel={() => {
+                    isDraggingMouthRef.current = false;
+                  }}
+                  className="relative w-40 rounded-xl overflow-hidden border-2 border-amber-500/70 bg-slate-950 cursor-crosshair select-none touch-none shadow-lg"
+                  style={{ aspectRatio: `${previewTargetW} / ${previewTargetH}` }}
+                  title="Tocca o trascina direttamente sulla bocca nella tua foto"
+                >
+                  <img
+                    src={customAnchor.customImageUrl}
+                    alt="Anteprima calibrazione bocca"
+                    className="w-full h-full object-fill pointer-events-none"
+                    onLoad={(e) => {
+                      const el = e.currentTarget;
+                      if (el.naturalWidth > 0 && el.naturalHeight > 0) {
+                        setPhotoAspect({ nw: el.naturalWidth, nh: el.naturalHeight });
+                      }
+                    }}
+                  />
+                  {/* Live Crosshair & Mouth Target Marker */}
+                  {(() => {
+                    const mx = customAnchor.mouthPosition?.x ?? 0;
+                    const my = customAnchor.mouthPosition?.y ?? -25;
+                    const ms = customAnchor.mouthPosition?.scale ?? 1.1;
+                    const leftPct = ((mx - previewDrawX) / previewTargetW) * 100;
+                    const topPct = ((my - previewDrawY) / previewTargetH) * 100;
+                    const mouthW = Math.max(12, Math.round(18 * ms));
+                    const mouthH = Math.max(6, Math.round((testMouthOpen ? 12 : 5) * ms));
+                    return (
+                      <div
+                        className="absolute pointer-events-none -translate-x-1/2 -translate-y-1/2 flex items-center justify-center"
+                        style={{
+                          left: `${leftPct}%`,
+                          top: `${topPct}%`,
+                        }}
+                      >
+                        <div
+                          className="rounded-full border-2 border-sky-400 bg-rose-500/60 shadow-[0_0_8px_rgba(56,189,248,0.9)]"
+                          style={{
+                            width: `${mouthW}px`,
+                            height: `${mouthH}px`,
+                          }}
+                        />
+                      </div>
+                    );
+                  })()}
+                </div>
+                <div className="text-[10px] text-center text-amber-300/90 font-medium">
+                  Tocca o trascina sulla tua bocca
+                </div>
               </div>
-              <input
-                type="range"
-                min={-60}
-                max={60}
-                value={customAnchor.mouthPosition?.x ?? 0}
-                onChange={(e) => handleUpdateMouthCalibration({ x: parseInt(e.target.value, 10) })}
-                className="w-full accent-amber-500"
-              />
-            </div>
+            )}
 
-            <div>
-              <div className="flex justify-between text-xs text-slate-300 mb-1">
-                <span>Posizione Verticale (Y):</span>
-                <span className="font-data">{customAnchor.mouthPosition?.y ?? 35}px</span>
-              </div>
-              <input
-                type="range"
-                min={-30}
-                max={120}
-                value={customAnchor.mouthPosition?.y ?? 35}
-                onChange={(e) => handleUpdateMouthCalibration({ y: parseInt(e.target.value, 10) })}
-                className="w-full accent-amber-500"
-              />
-            </div>
+            {/* Fine-Tuning Sliders + Lip Style */}
+            <div className="flex-1 w-full space-y-3">
+              <p className="text-xs text-slate-400">
+                Clicca direttamente sulla bocca nella foto qui accanto oppure regola con precisione i cursori:
+              </p>
 
-            <div>
-              <div className="flex justify-between text-xs text-slate-300 mb-1">
-                <span>Dimensione Bocca (Scala):</span>
-                <span className="font-data">{Math.round((customAnchor.mouthPosition?.scale ?? 1.1) * 100)}%</span>
+              <div className="flex items-center gap-2">
+                <span className="text-xs text-slate-300">Stile Labbra:</span>
+                <div className="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800 text-xs">
+                  <button
+                    type="button"
+                    onClick={() => handleUpdateMouthCalibration({ gender: 'male' })}
+                    className={`px-2.5 py-1 rounded transition-colors ${
+                      customAnchor.gender === 'male'
+                        ? 'bg-sky-600 text-white font-semibold'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Naturale / Uomo
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleUpdateMouthCalibration({ gender: 'female' })}
+                    className={`px-2.5 py-1 rounded transition-colors ${
+                      customAnchor.gender === 'female'
+                        ? 'bg-pink-600 text-white font-semibold'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Rossetto / Donna
+                  </button>
+                </div>
               </div>
-              <input
-                type="range"
-                min={60}
-                max={180}
-                value={Math.round((customAnchor.mouthPosition?.scale ?? 1.1) * 100)}
-                onChange={(e) => handleUpdateMouthCalibration({ scale: parseInt(e.target.value, 10) / 100 })}
-                className="w-full accent-amber-500"
-              />
+
+              <div className="grid grid-cols-1 gap-3 pt-1">
+                <div>
+                  <div className="flex justify-between text-xs text-slate-300 mb-1">
+                    <span>Posizione Orizzontale (X):</span>
+                    <span className="font-data text-amber-300">{customAnchor.mouthPosition?.x ?? 0}px</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={-135}
+                    max={135}
+                    value={customAnchor.mouthPosition?.x ?? 0}
+                    onChange={(e) => handleUpdateMouthCalibration({ x: parseInt(e.target.value, 10) })}
+                    className="w-full accent-amber-500"
+                  />
+                </div>
+
+                <div>
+                  <div className="flex justify-between text-xs text-slate-300 mb-1">
+                    <span>Posizione Verticale (Y):</span>
+                    <span className="font-data text-amber-300">{customAnchor.mouthPosition?.y ?? -25}px</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={-180}
+                    max={160}
+                    value={customAnchor.mouthPosition?.y ?? -25}
+                    onChange={(e) => handleUpdateMouthCalibration({ y: parseInt(e.target.value, 10) })}
+                    className="w-full accent-amber-500"
+                  />
+                </div>
+
+                <div>
+                  <div className="flex justify-between text-xs text-slate-300 mb-1">
+                    <span>Dimensione Bocca (Scala):</span>
+                    <span className="font-data text-amber-300">{Math.round((customAnchor.mouthPosition?.scale ?? 1.1) * 100)}%</span>
+                  </div>
+                  <input
+                    type="range"
+                    min={40}
+                    max={300}
+                    value={Math.round((customAnchor.mouthPosition?.scale ?? 1.1) * 100)}
+                    onChange={(e) => handleUpdateMouthCalibration({ scale: parseInt(e.target.value, 10) / 100 })}
+                    className="w-full accent-amber-500"
+                  />
+                </div>
+              </div>
             </div>
           </div>
         </div>

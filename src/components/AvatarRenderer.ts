@@ -66,7 +66,7 @@ export function drawAvatar(
 
   // If user uploaded custom anchor photo
   if (anchor.avatarType === 'custom') {
-    if (customImageObj && (customImageObj.complete || (customImageObj.naturalWidth && customImageObj.naturalWidth > 0))) {
+    if (customImageObj && customImageObj.complete && customImageObj.naturalWidth > 0) {
       drawCustomPhotoAnchor(ctx, customImageObj, anchor, metrics, anim);
     } else {
       drawCustomPhotoPlaceholder(ctx, anchor);
@@ -543,12 +543,12 @@ function drawCustomPhotoAnchor(
   _anim: AvatarAnimState
 ) {
   // Safe image dimension retrieval to avoid NaN
-  const nw = img.naturalWidth || img.width || 480;
-  const nh = img.naturalHeight || img.height || 560;
-  const targetW = 480;
-  const targetH = Math.min(720, Math.max(340, (nh / nw) * targetW));
+  const nw = img.naturalWidth || img.width || 280;
+  const nh = img.naturalHeight || img.height || 340;
+  const targetW = 280;
+  const targetH = Math.min(400, Math.max(190, (nh / nw) * targetW));
   const drawX = -targetW / 2;
-  const drawY = -targetH / 2 + 30;
+  const drawY = -targetH / 2 + 15;
 
   // Outer broadcast portrait shadow
   ctx.save();
@@ -557,14 +557,14 @@ function drawCustomPhotoAnchor(
   ctx.shadowOffsetY = 10;
   ctx.fillStyle = '#0f172a';
   ctx.beginPath();
-  ctx.roundRect(drawX, drawY, targetW, targetH, 24);
+  ctx.roundRect(drawX, drawY, targetW, targetH, 18);
   ctx.fill();
   ctx.shadowColor = 'transparent';
 
   // Draw portrait image clipped
   ctx.save();
   ctx.beginPath();
-  ctx.roundRect(drawX, drawY, targetW, targetH, 24);
+  ctx.roundRect(drawX, drawY, targetW, targetH, 18);
   ctx.clip();
   try {
     ctx.drawImage(img, drawX, drawY, targetW, targetH);
@@ -574,19 +574,19 @@ function drawCustomPhotoAnchor(
   ctx.restore();
 
   // Subtle studio rim highlight
-  ctx.strokeStyle = 'rgba(148, 163, 184, 0.4)';
-  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(148, 163, 184, 0.45)';
+  ctx.lineWidth = 2.5;
   ctx.beginPath();
-  ctx.roundRect(drawX, drawY, targetW, targetH, 24);
+  ctx.roundRect(drawX, drawY, targetW, targetH, 18);
   ctx.stroke();
   ctx.restore();
 
   // Overlay calibrated mouth with lip sync
-  const pos = anchor.mouthPosition || { x: 0, y: 35, scale: 1.1 };
+  const pos = anchor.mouthPosition || { x: 0, y: -25, scale: 1.1 };
   ctx.save();
   ctx.translate(pos.x, pos.y);
   ctx.scale(pos.scale, pos.scale);
-  drawLipSyncMouth(ctx, 0, 0, metrics, 'marco');
+  drawLipSyncMouth(ctx, 0, 0, metrics, anchor.gender === 'female' ? 'elena' : 'marco');
   ctx.restore();
 }
 
@@ -594,19 +594,19 @@ function drawCustomPhotoPlaceholder(
   ctx: CanvasRenderingContext2D,
   anchor: AnchorProfile
 ) {
-  const targetW = 480;
-  const targetH = 640;
+  const targetW = 280;
+  const targetH = 360;
   const drawX = -targetW / 2;
-  const drawY = -targetH / 2 + 30;
+  const drawY = -targetH / 2 + 15;
 
   ctx.save();
   ctx.fillStyle = '#0f172a';
   ctx.beginPath();
-  ctx.roundRect(drawX, drawY, targetW, targetH, 24);
+  ctx.roundRect(drawX, drawY, targetW, targetH, 18);
   ctx.fill();
 
   ctx.strokeStyle = '#38bdf8';
-  ctx.lineWidth = 3;
+  ctx.lineWidth = 2.5;
   ctx.setLineDash([8, 8]);
   ctx.stroke();
   ctx.setLineDash([]);
@@ -615,13 +615,13 @@ function drawCustomPhotoPlaceholder(
   ctx.fillStyle = '#94a3b8';
   ctx.textAlign = 'center';
   ctx.textBaseline = 'middle';
-  ctx.font = '700 24px "Plus Jakarta Sans", sans-serif';
-  ctx.fillText('FOTO CONDUTTORE', 0, -20);
+  ctx.font = '700 16px "Plus Jakarta Sans", sans-serif';
+  ctx.fillText('FOTO CONDUTTORE', 0, -14);
 
-  ctx.font = '500 16px "Plus Jakarta Sans", sans-serif';
+  ctx.font = '500 12px "Plus Jakarta Sans", sans-serif';
   ctx.fillStyle = '#64748b';
-  ctx.fillText(anchor.name || 'Personalizzato', 0, 15);
-  ctx.fillText('Carica la tua immagine nella scheda Conduttore', 0, 45);
+  ctx.fillText(anchor.name || 'Personalizzato', 0, 12);
+  ctx.fillText('Carica la tua immagine', 0, 34);
 
   ctx.restore();
 }

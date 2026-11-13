@@ -1,6 +1,6 @@
 import React, { useRef, useState } from 'react';
 import { BroadcastState, StudioBackground } from '../types';
-import { STUDIO_BACKGROUNDS } from '../constants/backgrounds';
+import { STUDIO_BACKGROUNDS, STUDIO_IMAGE_ASSETS } from '../constants/backgrounds';
 import { Upload, Image as ImageIcon, Sliders, Eye, Layout, Check, Trash2, Loader2, AlertCircle } from 'lucide-react';
 import { optimizeUploadedImage } from '../utils/imageOptimizer';
 
@@ -358,10 +358,10 @@ export const MediaControls: React.FC<MediaControlsProps> = ({
               <span className="text-[11px] text-slate-400 block mb-1.5 font-medium">O seleziona un'infografica rapida TG:</span>
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                 {[
-                  { tag: 'ESTERI', label: 'Esteri & Vertice', url: '/src/assets/images/global_affairs_studio_1794323880150.jpg' },
-                  { tag: "ULTIM'ORA", label: 'Breaking News', url: '/src/assets/images/breaking_news_studio_1794323879177.jpg' },
-                  { tag: 'ECONOMIA', label: 'Borsa & Finanza', url: '/src/assets/images/financial_tech_studio_1794323879883.jpg' },
-                  { tag: 'TG NOTIZIE', label: 'Studio Live', url: '/src/assets/images/newsroom_studio_backdrop_1794323879260.jpg' },
+                  { tag: 'ESTERI', label: 'Esteri & Vertice', url: STUDIO_IMAGE_ASSETS.global },
+                  { tag: "ULTIM'ORA", label: 'Breaking News', url: STUDIO_IMAGE_ASSETS.breaking },
+                  { tag: 'ECONOMIA', label: 'Borsa & Finanza', url: STUDIO_IMAGE_ASSETS.financial },
+                  { tag: 'TG NOTIZIE', label: 'Studio Live', url: STUDIO_IMAGE_ASSETS.newsroom },
                 ].map((item) => (
                   <button
                     key={item.tag}

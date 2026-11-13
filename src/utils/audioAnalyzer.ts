@@ -32,11 +32,16 @@ export class AudioLipSyncEngine {
   }
 
   public getAudioStream(): MediaStream | null {
-    if (!this.mediaStreamDest) {
-      const ctx = this.initContext();
-      this.mediaStreamDest = ctx.createMediaStreamDestination();
+    try {
+      if (!this.mediaStreamDest) {
+        const ctx = this.initContext();
+        this.mediaStreamDest = ctx.createMediaStreamDestination();
+      }
+      return this.mediaStreamDest.stream;
+    } catch (err) {
+      console.warn('MediaStream audio non disponibile:', err);
+      return null;
     }
-    return this.mediaStreamDest.stream;
   }
 
   public async playBase64Wav(

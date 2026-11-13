@@ -72,7 +72,7 @@ function loadSafeImage(
 
   // Check cache first for instant synchronous availability
   const cached = imageCache.get(url);
-  if (cached && (cached.complete || cached.naturalWidth > 0)) {
+  if (cached && cached.complete && cached.naturalWidth > 0) {
     onLoaded(cached);
     return;
   }
@@ -83,7 +83,7 @@ function loadSafeImage(
     return;
   }
 
-  if (img.complete && (img.naturalWidth > 0 || img.width > 0)) {
+  if (img.complete && img.naturalWidth > 0) {
     onLoaded(img);
     return;
   }
@@ -233,7 +233,7 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
         // Check user-uploaded custom background first
         if (curState.customBgUrl && customBgImageRef.current) {
           const customImg = customBgImageRef.current;
-          if (customImg.complete || (customImg.naturalWidth && customImg.naturalWidth > 0)) {
+          if (customImg.complete && customImg.naturalWidth > 0) {
             try {
               const nw = customImg.naturalWidth || customImg.width || 1920;
               const nh = customImg.naturalHeight || customImg.height || 1080;
@@ -263,7 +263,7 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
             ctx.fillStyle = curBg.chromaColor;
             ctx.fillRect(0, 0, W, H);
             drewBg = true;
-          } else if (presetBgImageRef.current && (presetBgImageRef.current.complete || (presetBgImageRef.current.naturalWidth && presetBgImageRef.current.naturalWidth > 0))) {
+          } else if (presetBgImageRef.current && presetBgImageRef.current.complete && presetBgImageRef.current.naturalWidth > 0) {
             try {
               const img = presetBgImageRef.current;
               const nw = img.naturalWidth || img.width || 1920;
@@ -421,7 +421,7 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
       {/* Off-screen Pre-Decoders for zero-delay canvas rendering */}
       {state.pip.enabled && state.pip.imageUrl && (
         <img
-          key={`pip-cache-${state.pip.imageUrl.slice(0, 32)}`}
+          key={`pip-cache-${state.pip.imageUrl.length}-${state.pip.imageUrl.slice(-32)}`}
           src={state.pip.imageUrl}
           alt=""
           className="hidden"
@@ -437,7 +437,7 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
       )}
       {state.customBgUrl && (
         <img
-          key={`bg-cache-${state.customBgUrl.slice(0, 32)}`}
+          key={`bg-cache-${state.customBgUrl.length}-${state.customBgUrl.slice(-32)}`}
           src={state.customBgUrl}
           alt=""
           className="hidden"
@@ -453,7 +453,7 @@ export const BroadcastCanvas: React.FC<BroadcastCanvasProps> = ({
       )}
       {currentAnchor.avatarType === 'custom' && currentAnchor.customImageUrl && (
         <img
-          key={`anchor-cache-${currentAnchor.customImageUrl.slice(0, 32)}`}
+          key={`anchor-cache-${currentAnchor.customImageUrl.length}-${currentAnchor.customImageUrl.slice(-32)}`}
           src={currentAnchor.customImageUrl}
           alt=""
           className="hidden"

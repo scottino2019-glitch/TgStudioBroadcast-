@@ -8,7 +8,7 @@ import {
 } from './types';
 import { LANGUAGES } from './constants/languages';
 import { ANCHOR_PROFILES } from './constants/anchors';
-import { STUDIO_BACKGROUNDS } from './constants/backgrounds';
+import { STUDIO_BACKGROUNDS, STUDIO_IMAGE_ASSETS } from './constants/backgrounds';
 import { globalAudioEngine } from './utils/audioAnalyzer';
 import { globalVideoRecorder, RecordingResult } from './utils/videoRecorder';
 import { resolveSystemVoice, splitTextIntoSpeechChunks } from './utils/speechVoices';
@@ -42,7 +42,7 @@ export default function App() {
     speechEngine: 'browser',
     pip: {
       enabled: true,
-      imageUrl: '/src/assets/images/global_affairs_studio_1794323880150.jpg',
+      imageUrl: STUDIO_IMAGE_ASSETS.global,
       topicTag: 'PRIMO PIANO',
       position: 'top-right',
     },
@@ -103,6 +103,7 @@ export default function App() {
   const [isPlayingSpeech, setIsPlayingSpeech] = useState(false);
   const [isLoadingVoice, setIsLoadingVoice] = useState(false);
   const [voiceNotice, setVoiceNotice] = useState<string | null>(null);
+  const [testMouthOpen, setTestMouthOpen] = useState(false);
 
   // Video Recording state & synchronization refs
   const [isRecording, setIsRecording] = useState(false);
@@ -300,7 +301,7 @@ export default function App() {
       const utterance = new SpeechSynthesisUtterance(chunks[chunkIndex]);
       if (chosenVoice) {
         utterance.voice = chosenVoice;
-        utterance.lang = chosenVoice.lang;
+        utterance.lang = chosenVoice.lang || currentLanguage.webSpeechLang;
       } else {
         utterance.lang = currentLanguage.webSpeechLang;
       }
@@ -344,6 +345,10 @@ export default function App() {
       // Start recording
       const canvas = canvasElementRef.current;
       if (!canvas) return;
+      if (typeof canvas.captureStream !== 'function' || typeof MediaRecorder === 'undefined') {
+        setVoiceNotice('La registrazione video diretta dal browser non è supportata su questo dispositivo.');
+        return;
+      }
 
       updateState({ showCreditsNow: false });
       const audioStream = globalAudioEngine.getAudioStream();
@@ -352,10 +357,14 @@ export default function App() {
       });
 
       if (started) {
+        setVoiceNotice(null);
+        setTestMouthOpen(false);
         isRecordingRef.current = true;
         setIsRecording(true);
         // Automatically start speech for video broadcast
         handlePlaySpeech();
+      } else {
+        setVoiceNotice('Impossibile avviare la registrazione video su questo browser.');
       }
     }
   };
@@ -411,7 +420,11 @@ export default function App() {
             state={state}
             currentAnchor={currentAnchor}
             currentBg={currentBg}
-            visemeMetrics={visemeMetrics}
+            visemeMetrics={
+              testMouthOpen && !isPlayingSpeech && !isRecording
+                ? { openness: 0.72, width: 0.65, teeth: 0.55, volume: 0.75, isSpeaking: true }
+                : visemeMetrics
+            }
             isRecording={isRecording}
             recordingSeconds={recordingSeconds}
             onSnapshot={handleSnapshot}
@@ -647,6 +660,8 @@ export default function App() {
               currentAnchor={currentAnchor}
               customAnchor={customAnchor}
               onUpdateCustomAnchor={setCustomAnchor}
+              testMouthOpen={testMouthOpen}
+              onToggleTestMouth={() => setTestMouthOpen((prev) => !prev)}
             />
           )}
 
