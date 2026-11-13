@@ -19,7 +19,11 @@ const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const isProduction = process.env.NODE_ENV === 'production';
 
-app.use(express.json({ limit: '10mb' }));
+const defaultJsonParser = express.json({ limit: '10mb' });
+app.use((req, res, next) => {
+  if (req.path === '/api/export-mp4') return next();
+  return defaultJsonParser(req, res, next);
+});
 
 // Health and API status
 app.get('/api/status', (_req, res) => {
@@ -254,11 +258,26 @@ app.post('/api/export-mp4', express.json({ limit: '250mb' }), async (req, res) =
     }
 
     await fs.promises.mkdir(tmpDir, { recursive: true });
-    const safeExt = videoFormat === 'mp4' ? 'mp4' : 'webm';
+    const base64MarkerIdx = videoBase64.indexOf(';base64,');
+    const cleanVideoBase64 =
+      base64MarkerIdx >= 0 ? videoBase64.slice(base64MarkerIdx + 8) : videoBase64;
+    const videoBuffer = Buffer.from(cleanVideoBase64, 'base64');
+
+    const isEbmlWebm =
+      videoBuffer.length >= 4 &&
+      videoBuffer[0] === 0x1a &&
+      videoBuffer[1] === 0x45 &&
+      videoBuffer[2] === 0xdf &&
+      videoBuffer[3] === 0xa3;
+    const isIsoMp4 =
+      videoBuffer.length >= 8 &&
+      videoBuffer.subarray(4, 8).toString('ascii') === 'ftyp';
+
+    const safeExt = isIsoMp4 ? 'mp4' : isEbmlWebm ? 'webm' : videoFormat === 'mp4' ? 'mp4' : 'webm';
     const inputVideoPath = path.join(tmpDir, `input.${safeExt}`);
     const outputMp4Path = path.join(tmpDir, 'output.mp4');
 
-    await fs.promises.writeFile(inputVideoPath, Buffer.from(videoBase64, 'base64'));
+    await fs.promises.writeFile(inputVideoPath, videoBuffer);
 
     const validChunks = Array.isArray(audioChunks)
       ? audioChunks.filter((c): c is string => typeof c === 'string' && c.length > 0)

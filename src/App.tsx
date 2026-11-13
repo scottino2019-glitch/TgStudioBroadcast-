@@ -223,11 +223,18 @@ export default function App() {
       const reader = new FileReader();
       reader.onload = () => {
         const res = typeof reader.result === 'string' ? reader.result : '';
-        const idx = res.indexOf(',');
-        resolve(idx >= 0 ? res.slice(idx + 1) : res);
+        const marker = ';base64,';
+        const markerIdx = res.indexOf(marker);
+        if (markerIdx >= 0) {
+          resolve(res.slice(markerIdx + marker.length));
+        } else {
+          const commaIdx = res.indexOf(',');
+          resolve(commaIdx >= 0 ? res.slice(commaIdx + 1) : res);
+        }
       };
       reader.onerror = () => reject(new Error('Errore conversione blob video.'));
-      reader.readAsDataURL(blob);
+      // Strip codec parameters containing commas (e.g. vp8,opus) before base64 encoding
+      reader.readAsDataURL(new Blob([blob], { type: 'application/octet-stream' }));
     });
   };
 

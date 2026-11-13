@@ -165,7 +165,8 @@ export class VideoRecorderManager {
       }
 
       const durationSec = Math.max(1, (performance.now() - this.startTime) / 1000);
-      const mime = recorder.mimeType || 'video/webm';
+      const chunkMime = this.recordedChunks.find((c) => c.type)?.type;
+      const mime = recorder.mimeType || chunkMime || 'video/webm';
       const hadAudio = this.hasAudioTrack;
 
       const finalizeResult = () => {
