@@ -310,12 +310,13 @@ export default function App() {
 
       try {
         // Fast binary stream upload (zero FileReader, zero 33% base64 bloat)
+        const binaryBody = new Blob([rawResult.blob], { type: 'application/octet-stream' });
         exportResp = await fetch(
           `/api/export-mp4-bin?format=${encodeURIComponent(rawResult.format)}&audioId=${encodeURIComponent(activeAudioId)}`,
           {
             method: 'POST',
             headers: { 'Content-Type': 'application/octet-stream' },
-            body: rawResult.blob,
+            body: binaryBody,
             signal: exportController.signal,
           }
         );
@@ -338,6 +339,11 @@ export default function App() {
       }
 
       if (!exportResp.ok) {
+        if (exportResp.status === 404 && rawResult.hasAudio) {
+          // On static/serverless hosting without FFmpeg (e.g. Vercel), deliver the recorded MediaRecorder file directly with its embedded Web Audio track
+          setRecordingResult(rawResult);
+          return;
+        }
         const errData = await exportResp.json().catch(() => ({}));
         throw new Error(errData?.error || `Errore conversione MP4 (HTTP ${exportResp.status})`);
       }
@@ -367,14 +373,14 @@ export default function App() {
       isRecordingRef.current = false;
       setRecordingSeconds(0);
 
-      if (rawResult && rawResult.hasAudio && activeRecordedChunks.length === 0) {
+      if (rawResult && rawResult.hasAudio) {
         setRecordingResult(rawResult);
         setVoiceNotice(
-          `Conversione MP4 non riuscita (${err?.message || 'errore FFmpeg'}). Scarica il file originale ${rawResult.format.toUpperCase()}.`
+          `Esportazione diretta ${rawResult.format.toUpperCase()} con audio vocale inclusa (conversione server MP4 non disponibile).`
         );
       } else {
         if (rawResult?.url) URL.revokeObjectURL(rawResult.url);
-        setVoiceNotice(err?.message || 'Errore durante la creazione del video MP4 con audio.');
+        setVoiceNotice(err?.message || 'Errore durante la creazione del video con audio.');
       }
     } finally {
       setIsExportingMp4(false);
@@ -423,12 +429,9 @@ export default function App() {
           setIsPlayingSpeech(false);
         });
         return;
-      } catch (err: any) {
+      } catch {
         if (speechSessionRef.current !== sessionId) return;
         setIsLoadingVoice(false);
-        setVoiceNotice(
-          `${err?.message || 'Voce Google Studio non disponibile'}: passaggio alla voce locale del browser per l’anteprima.`
-        );
         playWebSpeech();
         return;
       }
@@ -437,13 +440,68 @@ export default function App() {
     playWebSpeech();
   };
 
+  // Direct client-side Google Translate <audio> fallback when neither /api/free-tts nor local Web Speech voices exist
+  const playDirectGoogleAudioChunks = (sessionId: number) => {
+    const langTag = currentLanguage.webSpeechLang || 'it-IT';
+    const tl = langTag.toLowerCase().startsWith('zh') ? 'zh-CN' : langTag.split('-')[0] || 'it';
+    const chunks = splitTextIntoSpeechChunks(stateRef.current.scriptText, 160);
+    if (chunks.length === 0) return;
+
+    const words = stateRef.current.scriptText.trim().split(/\s+/).length;
+    const estSec = Math.max(4, (words / 115) * 60) + 12;
+    setIsPlayingSpeech(true);
+    globalAudioEngine.startSpeechSimulation(estSec, handleAudioMetrics);
+
+    let idx = 0;
+    const finishAll = () => {
+      if (speechSessionRef.current !== sessionId) return;
+      setIsPlayingSpeech(false);
+      globalAudioEngine.stop();
+    };
+
+    const next = () => {
+      if (speechSessionRef.current !== sessionId) return;
+      if (idx >= chunks.length) {
+        finishAll();
+        return;
+      }
+      const url = `https://translate.googleapis.com/translate_tts?ie=UTF-8&q=${encodeURIComponent(
+        chunks[idx]
+      )}&tl=${encodeURIComponent(tl)}&client=gtx`;
+      const audio = new Audio(url);
+      audio.onended = () => {
+        if (speechSessionRef.current !== sessionId) return;
+        idx += 1;
+        next();
+      };
+      audio.onerror = () => {
+        if (speechSessionRef.current !== sessionId) return;
+        idx += 1;
+        next();
+      };
+      audio.play().catch(() => {
+        if (speechSessionRef.current !== sessionId) return;
+        idx += 1;
+        next();
+      });
+    };
+
+    next();
+  };
+
   // Chunked Google Web Speech player with Chromium keep-alive, pitch/rate, and anchor gender matching
   const playWebSpeech = () => {
     const sessionId = ++speechSessionRef.current;
     clearSpeechKeepAlive();
 
     if (typeof window === 'undefined' || !window.speechSynthesis) {
-      setVoiceNotice('Sintesi vocale Web Speech non supportata su questo browser.');
+      playDirectGoogleAudioChunks(sessionId);
+      return;
+    }
+
+    const availableVoices = window.speechSynthesis.getVoices() || [];
+    if (availableVoices.length === 0) {
+      playDirectGoogleAudioChunks(sessionId);
       return;
     }
 

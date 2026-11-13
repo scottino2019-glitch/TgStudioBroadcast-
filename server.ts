@@ -453,7 +453,7 @@ async function muxVideoBufferToMp4(
 }
 
 // Fast binary MP4 muxer endpoint (zero base64 overhead, zero FileReader memory spike)
-app.post('/api/export-mp4-bin', express.raw({ type: 'application/octet-stream', limit: '250mb' }), async (req, res) => {
+app.post('/api/export-mp4-bin', express.raw({ type: '*/*', limit: '250mb' }), async (req, res) => {
   try {
     const videoBuffer = req.body;
     if (!Buffer.isBuffer(videoBuffer) || videoBuffer.length === 0) {
